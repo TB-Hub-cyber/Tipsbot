@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 # main.py – komplett API för Stryktipsflödet med källväxling (SVS/Stryketanalysen)
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,17 +8,18 @@ import os, asyncio, traceback
 
 # ---- Projektmoduler ----
 # models.py ska innehålla:
-#   class SvsReq(BaseModel): url: Any; debug: bool = False
-#   class FootyReq(BaseModel): matchnr: int; url: Any; debug: bool = False
+#   class SvsReq(BaseModel): url: object; debug: bool = False
+#   class FootyReq(BaseModel): matchnr: int; url: object; debug: bool = False
 from models import SvsReq, FootyReq
 
 # Scrapers
 from scrape_svspel import fetch_kupong as fetch_svs   # async
-from scrape_stryket import fetch_stryket              # sync
+from scrape_stryket import fetch_stryket              # sync (har debugstöd)
 
 # Excel-hjälpare
 from excel_utils import (
-    update_kupong, update_footy, write_excel_bytes, reset_state as excel_reset_state
+    update_kupong, update_footy, write_excel_bytes,
+    reset_state as excel_reset_state
 )
 import excel_utils  # för /debug/state
 
@@ -26,7 +28,7 @@ TEMPLATE = "Stryktipsanalys_MASTER.xlsx"
 PW_CACHE = "/opt/render/.cache/ms-playwright"
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PW_CACHE)
 
-app = FastAPI(title="Stryktips API", version="1.1")
+app = FastAPI(title="Stryktips API", version="1.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +36,7 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ---- Självläkning: installera Chromium om cachen är tom ----
+# ---- Självläkning: installera Chromium om Render-cachen är tom ----
 async def _chromium_present() -> bool:
     if not os.path.isdir(PW_CACHE):
         return False
@@ -48,8 +50,11 @@ async def _install_chromium():
         "python", "-m", "playwright", "install", "chromium",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
-    await proc.communicate()
+    out, err = await proc.communicate()
     print("[startup] playwright install chromium ->", proc.returncode)
+    if proc.returncode != 0:
+        print(out.decode(errors="ignore"))
+        print(err.decode(errors="ignore"))
 
 @app.on_event("startup")
 async def startup():
@@ -66,18 +71,17 @@ def reset():
     excel_reset_state()
     return {"ok": True}
 
-# ---- Kupong (auto-källa) ----
+# ---- Kupong (auto-källa: SVS eller Stryketanalysen) ----
 @app.post("/svenskaspel")
 async def svenskaspel(req: SvsReq):
     """
-    Hämtar kupongen och skriver den till serverns arbetsbok/state.
-    Källval:
-      - URL innehåller 'svenskaspel.se'  -> Playwright-scrape (async)
-      - URL innehåller 'stryketanalysen.se' -> requests/BS4-scrape (sync)
-    Returnerar alltid 200 med {ok: bool, ...} så klienten kan visa fel snyggt.
+    Hämtar kupongen och skriver in den i serverns arbetsbok/state.
+    - Om URL innehåller 'svenskaspel.se'  -> Playwright-scrape (async)
+    - Om URL innehåller 'stryketanalysen.se' -> requests/BS4-scrape (sync)
+    Returnerar alltid 200 med {ok: bool, ...}.
     """
     try:
-        url = str(req.url).strip()  # <— viktig fix för pydantic Url
+        url = str(req.url).strip()  # viktigt om req.url är pydantic Url
         if not url:
             return {"ok": False, "error": "Ingen URL angiven."}
 
@@ -85,7 +89,7 @@ async def svenskaspel(req: SvsReq):
             out = await fetch_svs(url, debug=req.debug)
             källa = "Svenska Spel"
         elif "stryketanalysen.se" in url:
-            out = fetch_stryket(url)
+            out = fetch_stryket(url, debug=req.debug)
             källa = "Stryketanalysen"
         else:
             return {"ok": False, "error": "Okänd kupongkälla. Ange SVS- eller Stryketanalysen-URL."}
@@ -152,6 +156,13 @@ def debug_svs_shot():
     if not os.path.exists(p):
         raise HTTPException(404, "Ingen svs_debug.png ännu – kör /svenskaspel med debug=True.")
     return FileResponse(p, media_type="image/png", filename="svs_debug.png")
+
+@app.get("/debug/stryket-html")
+def debug_stryket_html():
+    p = "/tmp/stryket_debug.html"
+    if not os.path.exists(p):
+        raise HTTPException(404, "Ingen stryket_debug.html ännu – kör /svenskaspel med debug=True på Stryket-URL.")
+    return FileResponse(p, media_type="text/html", filename="stryket_debug.html")
 
 @app.get("/")
 def root():
