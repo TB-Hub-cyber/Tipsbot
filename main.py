@@ -11,7 +11,7 @@ from excel_utils import (
     write_excel_bytes,
     reset_state as excel_reset_state,
 )
-import excel_utils  # för att läsa state i /debug/state
+import excel_utils  # för /debug/state
 
 TEMPLATE = "Stryktipsanalys_MASTER.xlsx"
 
@@ -63,11 +63,11 @@ def reset():
 @app.get("/debug/state")
 def debug_state():
     """
-    Visar vad som just nu ligger i minnet på servern.
-    'svenskaspel' är listan med matcher/odds/streck.
-    'footy' är en dict: matchnr -> footydata.
+    Visar vad som ligger i minnet just nu.
+    'svenskaspel' = list[dict] med matcher/odds/streck.
+    'footy' = dict: matchnr -> footydata.
     """
     return {
-        "svenskaspel": excel_utils.KUPONG,  # list[dict]
-        "footy": excel_utils.FOOTY,        # dict[int, dict]
+        "svenskaspel": excel_utils.KUPONG,
+        "footy": excel_utils.FOOTY,
     }
