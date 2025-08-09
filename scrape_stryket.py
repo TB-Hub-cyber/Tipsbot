@@ -3,9 +3,6 @@
 # Returnerar {"results":[{ matchnr, hemmalag, bortalag, odds_1, odds_x, odds_2,
 #                          folk_1, folk_x, folk_2, spelv_1, spelv_x, spelv_2 }]}
 # eller {"error": "..."}.
-#
-# Körs från main.py med:
-#   out = await fetch_stryket(url, debug=True/False)
 
 from typing import Dict, Any, List, Optional, Iterable
 import re
@@ -16,7 +13,7 @@ from playwright.async_api import async_playwright
 
 NAME = r"[A-Za-zÅÄÖåäö0-9\.\-’'&() ]+"
 
-# Viktigt: bindestrecket MÅSTE ha mellanslag runt sig ("Halmstad - Sirius")
+# Bindestrecket MÅSTE ha mellanslag: "Halmstad - Sirius"
 TITLE_RX = re.compile(fr"({NAME})\s-\s({NAME})")
 
 NUM_RX = re.compile(r"(\d+(?:[.,]\d+)?)")
@@ -65,19 +62,27 @@ def _pick_three_pcts(text: str):
     return vals
 
 def _nearest_match_container(node: Tag) -> Optional[Tag]:
-    """Från en label-nod (t.ex. 'Svenska folket') klättra uppåt tills vi hittar ett block
-    som även innehåller titel 'Lag - Lag' och texten 'Odds'."""
+    """Från 'Svenska folket'-noden: hitta blocket som även har titel och 'Odds'."""
     cur: Optional[Tag] = node
     for _ in range(8):
         if cur is None:
             return None
         txt = " ".join(cur.stripped_strings)
-        # Sök titel endast i prefix före 'Odds' (undviker 'Start-odds')
         prefix = txt.split("Odds", 1)[0] if "Odds" in txt else txt
         if "Odds" in txt and TITLE_RX.search(prefix):
             return cur
         cur = cur.parent if isinstance(cur.parent, Tag) else None
     return None
+
+# Städar lagsträngar: tar bort matchnr i början och "1 X 2" o.l. i slutet
+RM_MATCHNR = re.compile(r"^\s*\d+\s*")
+RM_BTNS    = re.compile(r"\s*(?:1\s*X\s*2|1X2|(?:^|\s)(?:1|X|2))\s*$")
+
+def _tidy_team(s: str) -> str:
+    s = RM_MATCHNR.sub("", s or "")
+    # ta bort avslutande spelknappstext om den verkligen ligger sist
+    s = RM_BTNS.sub("", s)
+    return s.strip(" -\u00a0")  # även hårt mellanslag
 
 # ------------------------------- Parser -------------------------------------
 
@@ -85,7 +90,7 @@ def _parse(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
 
-    # 1) Primär: hitta varje matchblock via labeln "Svenska folket"
+    # 1) Primärt: block via "Svenska folket"
     folk_labels: Iterable[Tag] = soup.find_all(string=re.compile(r"^\s*Svenska folket\s*$", re.I))
     containers: List[Tag] = []
     for lbl in folk_labels:
@@ -94,7 +99,7 @@ def _parse(html: str) -> List[Dict[str, Any]]:
         if cont and cont not in containers:
             containers.append(cont)
 
-    # 2) Fallback: generiska block som innehåller titel + Odds + Svenska folket
+    # 2) Fallback: generiska block
     if not containers:
         for blk in soup.select(".content div, .entry-content div, li, article, .match, .match-row"):
             if not isinstance(blk, Tag):
@@ -114,17 +119,16 @@ def _parse(html: str) -> List[Dict[str, Any]]:
                 if TITLE_RX.search(prefix):
                     containers.append(tr)
 
-    # 4) Plocka fält ur respektive container
+    # 4) Extrahera fält
     for cont in containers:
         txt = " ".join(cont.stripped_strings)
-
-        # Sök titel enbart i texten före "Odds"
         prefix = txt.split("Odds", 1)[0] if "Odds" in txt else txt
+
         m = TITLE_RX.search(prefix)
         if not m:
             continue
-        home = m.group(1).strip()
-        away = m.group(2).strip()
+        home = _tidy_team(m.group(1))
+        away = _tidy_team(m.group(2))
 
         odds_txt = _section_after_label(txt, "Odds")
         folk_txt = _section_after_label(txt, "Svenska folket")
@@ -142,7 +146,7 @@ def _parse(html: str) -> List[Dict[str, Any]]:
             "spelv_1": s1, "spelv_x": sx, "spelv_2": s2,
         })
 
-    # 5) Deduplicera + numrera 1..13
+    # 5) Deduplicera + numrera
     seen = set()
     unique: List[Dict[str, Any]] = []
     for r in results:
@@ -161,14 +165,7 @@ def _parse(html: str) -> List[Dict[str, Any]]:
 # ------------------------------- Scraper ------------------------------------
 
 async def fetch_stryket(url_obj, debug: bool = False) -> Dict[str, Any]:
-    """
-    Async Playwright:
-      - renderar sidan
-      - väntar in 'Svenska folket' (eller 'Odds' som fallback)
-      - scrollar för att trigga lazyload
-      - sparar debug-HTML/PNG om debug=True
-      - parser och returnerar 13 matcher
-    """
+    """Renderar sidan (Async Playwright), sparar debug vid behov och parser till 13 matcher."""
     url = str(url_obj).strip()
     if not url:
         return {"error": "Ingen URL angiven."}
@@ -191,13 +188,13 @@ async def fetch_stryket(url_obj, debug: bool = False) -> Dict[str, Any]:
 
             await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-            # Vänta in att matchrutor finns (”Svenska folket” eller ”Odds”)
+            # Vänta in block (”Svenska folket” är stabilast, ”Odds” som fallback)
             try:
                 await page.wait_for_selector(":text('Svenska folket')", timeout=25_000)
             except Exception:
                 await page.wait_for_selector(":text('Odds')", timeout=10_000)
 
-            # Scrolla genom sidan för att trigga ev. lazyload
+            # Scrolla för ev. lazyload
             await page.evaluate(
                 """() => new Promise(res => {
                     let y = 0, step = 1200, limit = 10, i = 0;
@@ -226,7 +223,6 @@ async def fetch_stryket(url_obj, debug: bool = False) -> Dict[str, Any]:
         rows = _parse(html)
         if not rows:
             return {"error": "Hittade inga matcher på sidan."}
-
         return {"results": rows}
 
     except Exception as e:
