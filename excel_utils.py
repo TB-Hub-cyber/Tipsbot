@@ -1,7 +1,6 @@
-# excel_utils.py – HEL & kompatibel med main.py (update_kupong + write_excel_bytes)
+# excel_utils.py – No-op layout (respekterar din mall)
 from __future__ import annotations
 from openpyxl import load_workbook
-from openpyxl.utils import column_index_from_string
 from io import BytesIO
 from typing import Dict, Any, List
 
@@ -16,7 +15,7 @@ def reset_state():
 
 # ---------- Kolumnlayout (1-baserad) ----------
 # A=1, B=2, ...
-# Efter layoutfixen ligger Spelvärde i J:K:L.
+# Din mall har Spelvärde i J:K:L – vi skriver bara dit.
 COLS = {
     "matchnr": 1,       # A
     "hemmalag": 2,      # B
@@ -42,39 +41,31 @@ def _pick(d: dict, *names, default=None):
 
 def _put(ws, row: int, key: str, value):
     col = COLS.get(key)
-    if col:
+    if col is not None:
         ws.cell(row=row, column=col, value=value)
 
 def _ensure_layout(ws):
     """
-    Säkerställ att:
-      - J,K,L finns och heter Spelvärde 1/X/2 (infoga 3 kolumner från J om saknas)
-      - Kolumner AK, AL, AM tas bort om de finns (alltid, i omvänd ordning)
+    Respektera mallen. Gör inget med kolumner.
+    Sätt bara rubriker i J/K/L om de helt saknas.
     """
-    # 1) Spelvärdekolumner på J:K:L
-    header_j = (ws.cell(row=1, column=COLS["spelv_1"]).value or "").strip() if ws.max_column >= COLS["spelv_1"] else ""
-    if header_j != "Spelvärde 1":
-        ws.insert_cols(COLS["spelv_1"], amount=3)
+    header_j = (ws.cell(row=1, column=COLS["spelv_1"]).value or "").strip()
+    header_k = (ws.cell(row=1, column=COLS["spelv_x"]).value or "").strip()
+    header_l = (ws.cell(row=1, column=COLS["spelv_2"]).value or "").strip()
+
+    if not header_j and not header_k and not header_l:
         ws.cell(row=1, column=COLS["spelv_1"], value="Spelvärde 1")
         ws.cell(row=1, column=COLS["spelv_x"], value="Spelvärde X")
         ws.cell(row=1, column=COLS["spelv_2"], value="Spelvärde 2")
-
-    # 2) Ta bort AK, AL, AM i omvänd ordning så index inte flyttar sig
-    for col_letter in ["AM", "AL", "AK"]:
-        idx = column_index_from_string(col_letter)
-        if ws.max_column >= idx:
-            ws.delete_cols(idx, 1)
+    # i övrigt: rör inget
 
 # ---------- API som main.py anropar ----------
 def update_kupong(rows: List[Dict[str, Any]]):
     """
-    Tar listan från scrapen (13 rader) och normaliserar nycklarna.
-    Vi skriver inte till fil här – vi sparar i KUPONG och låter
-    write_excel_bytes() göra själva skrivningen vid nedladdning.
+    Lagra kupongrader (13 st). Skrivs till Excel vid write_excel_bytes().
     """
     global KUPONG
     KUPONG = []
-
     for i, r in enumerate(rows[:13], start=1):
         KUPONG.append({
             "matchnr": _pick(r, "matchnr", default=i),
@@ -92,18 +83,17 @@ def update_kupong(rows: List[Dict[str, Any]]):
         })
 
 def update_footy(matchnr: int, data: Dict[str, Any]):
-    """Valfri: spara FootyStats-data per matchnr (för din andra flik)."""
+    """Valfri: spara FootyStats-data per matchnr (för ev. separat flik)."""
     FOOTY[matchnr] = data or {}
 
 def write_excel_bytes(template_path: str) -> bytes:
     """
-    Öppnar mallen, justerar layouten (J:K:L + ta bort AK/AL/AM), skriver KUPONG
-    (+ ev. FOOTY) och returnerar filen som bytes.
+    Öppnar mallen, säkerställer rubriker i J/K/L om de saknas,
+    skriver KUPONG (och ev. FOOTY), och returnerar bytes.
     """
     wb = load_workbook(template_path)
     ws = wb[SHEET_NAME] if SHEET_NAME and SHEET_NAME in wb.sheetnames else wb.active
 
-    # Säkerställ layout
     _ensure_layout(ws)
 
     # Skriv kupongraderna
@@ -122,13 +112,13 @@ def write_excel_bytes(template_path: str) -> bytes:
         _put(ws, row, "spelv_x", r.get("spelv_x"))
         _put(ws, row, "spelv_2", r.get("spelv_2"))
 
-    # (Valfritt) skriv FOOTY på egen flik
+    # (Valfritt) skriv FOOTY på egen flik om du vill i framtiden
     # if "Footy" in wb.sheetnames and FOOTY:
     #     wf = wb["Footy"]
     #     for mn, data in FOOTY.items():
     #         row = START_ROW - 1 + mn
     #         wf.cell(row=row, column=1, value=mn)
-    #         # ... fyll fler fält här
+    #         # Fyll fler fält här...
 
     bio = BytesIO()
     wb.save(bio)
