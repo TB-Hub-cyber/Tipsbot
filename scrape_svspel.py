@@ -1,152 +1,161 @@
 # -*- coding: utf-8 -*-
-# scrape_svspel.py – hämtar kupongsida och plockar ut matchnr, lag och odds.
-# Bygger på Playwright + BeautifulSoup. Säker mot "Url-objekt" (str(url) i goto).
+# scrape_svspel.py – robust hämtning av kupongsida från Svenska Spel
 
-from typing import Dict, Any, List
-import asyncio
-import os
-import re
+from typing import Dict, Any, Tuple, Optional, List
+import asyncio, os, re
 from playwright.async_api import async_playwright
-from bs4 import BeautifulSoup
 
-# Se till att Playwright använder en skrivbar cache på Render
 PW_CACHE = "/opt/render/.cache/ms-playwright"
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PW_CACHE)
 
-# Modern Chrome-UA (kan utökas om det behövs)
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
+def _anti_detect_js() -> str:
+    return r"""
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+window.chrome = { runtime: {} };
+Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4] });
+Object.defineProperty(navigator, 'languages', { get: () => ['sv-SE','sv','en-US','en'] });
+"""
 
-async def _open_page(url: str):
-    """Öppnar sidan och returnerar HTML (eller kastar fel med status)."""
+async def _ensure_chromium() -> None:
+    # Installera browser om cache saknas
+    ok = False
+    if os.path.isdir(PW_CACHE):
+        for r, _, files in os.walk(PW_CACHE):
+            if "chrome" in files:
+                ok = True
+                break
+    if not ok:
+        proc = await asyncio.create_subprocess_exec(
+            "python", "-m", "playwright", "install", "chromium",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
+
+async def _open_and_get_html(url: str, debug: bool) -> Tuple[str, Optional[int]]:
+    """Öppnar sidan och returnerar (html, status). Höga timeouts + networkidle."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--disable-blink-features=AutomationControlled"]
         )
         ctx = await browser.new_context(
-            user_agent=UA,
-            locale="sv-SE",
-            timezone_id="Europe/Stockholm",
+            user_agent=UA, locale="sv-SE", timezone_id="Europe/Stockholm",
             viewport={"width": 1366, "height": 850},
+            extra_http_headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "sv-SE,sv;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
+        await ctx.add_init_script(_anti_detect_js())
         page = await ctx.new_page()
-        # VIKTIGT: konvertera alltid till sträng
-        resp = await page.goto(str(url), wait_until="domcontentloaded")
+        page.set_default_timeout(60_000)  # 60 sek
+
+        resp = await page.goto(str(url), wait_until="domcontentloaded", timeout=60_000)
+        # ge nätverket chans att bli idle
         try:
-            await page.wait_for_load_state("networkidle", timeout=8000)
+            await page.wait_for_load_state("networkidle", timeout=20_000)
         except Exception:
             pass
-
-        if not resp or (resp.status and resp.status >= 400):
-            status = resp.status if resp else "No response"
-            await ctx.close(); await browser.close()
-            raise RuntimeError(f"Svs-fel: status {status}")
 
         html = await page.content()
-
-        # Spara debugfiler som hjälp vid felsökning
+        status = None
         try:
-            await page.screenshot(path="/tmp/svs_debug.png", full_page=True)
-            with open("/tmp/svs_debug.html", "w", encoding="utf-8") as f:
-                f.write(html)
+            if resp:
+                status = resp.status
         except Exception:
-            pass
+            status = None
+
+        if debug:
+            try:
+                await page.screenshot(path="/tmp/svs_debug.png", full_page=True)
+                with open("/tmp/svs_debug.html", "w", encoding="utf-8") as f:
+                    f.write(html)
+            except Exception:
+                pass
 
         await ctx.close(); await browser.close()
-        return html
+        return html, status
 
+def _parse(html: str) -> List[Dict[str, Any]]:
+    """Tolerant parser för matchnr, lag och odds."""
+    rows: List[Dict[str, Any]] = []
 
-def _parse_matches(html: str) -> List[Dict[str, Any]]:
-    """
-    Försöker hitta 13 rader med matchnummer, lag och odds.
-    Vi använder både CSS-klasser (om de finns) och fallback-regex.
-    'Svenska folket' varierar i DOM – vi lämnar den tom tills vi stabilt kan fånga den.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    out: List[Dict[str, Any]] = []
+    # Försök 1: CSS-liknande mönster
+    # (behåller regex för att överleva DOM-ändringar)
+    titles = re.findall(
+        r'>([A-Za-zÅÄÖåäö0-9\.\'’\-\/& ]+?)\s*-\s*([A-Za-zÅÄÖåäö0-9\.\'’\-\/& ]+?)<',
+        html
+    )
+    odds = re.findall(
+        r'Odds[^0-9]*(\d+(?:[.,]\d+)?)[^\d]+(\d+(?:[.,]\d+)?)[^\d]+(\d+(?:[.,]\d+)?)',
+        html, re.S | re.I
+    )
 
-    # 1) Försök med semantiska klassnamn om de finns
-    rows = soup.select("div.sry-match-row, li.MatchRow, div.match-row")
-    for i, row in enumerate(rows, start=1):
-        # matchnummer
-        nr = None
-        nr_el = row.select_one(".sry-match-row__number, .MatchRow-number, .match-number")
-        if nr_el:
-            nr = nr_el.get_text(strip=True)
-            try:
-                nr = int(re.sub(r"\D+", "", nr))
-            except Exception:
-                nr = i  # fallback
-        else:
-            nr = i
+    n = min(len(titles), len(odds))
+    for i in range(n):
+        h, a = titles[i][0].strip(), titles[i][1].strip()
+        o1, ox, o2 = (x.replace(",", ".") for x in odds[i])
+        try:
+            rows.append({
+                "matchnr": i + 1,
+                "hemmalag": h, "bortalag": a,
+                "odds_1": float(o1), "odds_x": float(ox), "odds_2": float(o2),
+                "folk_1": None, "folk_x": None, "folk_2": None,
+            })
+        except Exception:
+            continue
 
-        # lag
-        h = row.select_one(".sry-match-row__team--home, .team-home, .home, .MatchRow-home")
-        a = row.select_one(".sry-match-row__team--away, .team-away, .away, .MatchRow-away")
-        home = (h.get_text(strip=True) if h else "").strip()
-        away = (a.get_text(strip=True) if a else "").strip()
-
-        # odds (tre värden)
-        odds_els = row.select(".sry-odds__value, .odds__value, .odds")
-        odds_vals = [el.get_text(strip=True) for el in odds_els][:3]
-        if len(odds_vals) < 3:
-            # prova regex lokalt på raden
-            txt = row.get_text(" ", strip=True)
-            m = re.findall(r"(\d+(?:[.,]\d+)?)", txt)
-            if len(m) >= 3:
-                odds_vals = m[:3]
-
-        if home and away and len(odds_vals) == 3:
-            o1, ox, o2 = (v.replace(",", ".") for v in odds_vals)
-            try:
-                out.append({
-                    "matchnr": int(nr),
-                    "hemmalag": home,
-                    "bortalag": away,
-                    "odds_1": float(o1),
-                    "odds_x": float(ox),
-                    "odds_2": float(o2),
-                    # lämnar folk tomt tills vi fångar stabilt:
-                    "folk_1": None, "folk_x": None, "folk_2": None,
-                })
-            except Exception:
-                pass
-
-    # 2) Om det inte lyckades – global fallback via regex på hela HTML
-    if not out:
-        titles = re.findall(
-            r'>([A-Za-zÅÄÖåäö0-9\.\'’\-\/& ]+?)\s*-\s*([A-Za-zÅÄÖåäö0-9\.\'’\-\/& ]+?)<',
-            html
-        )
-        odds = re.findall(
-            r'Odds[^0-9]*(\d+(?:[.,]\d+)?)[^\d]+(\d+(?:[.,]\d+)?)[^\d]+(\d+(?:[.,]\d+)?)',
-            html, re.S | re.I
-        )
-        n = min(len(titles), len(odds))
-        for i in range(n):
-            h, a = titles[i][0].strip(), titles[i][1].strip()
-            o1, ox, o2 = (x.replace(",", ".") for x in odds[i])
-            try:
-                out.append({
-                    "matchnr": i + 1,
-                    "hemmalag": h, "bortalag": a,
-                    "odds_1": float(o1), "odds_x": float(ox), "odds_2": float(o2),
-                    "folk_1": None, "folk_x": None, "folk_2": None,
-                })
-            except Exception:
-                pass
-
-    return out
-
+    return rows
 
 async def fetch_kupong(url: str, debug: bool = False) -> Dict[str, Any]:
     """
-    Lyckat:  { "results": [ {matchnr, hemmalag, bortalag, odds_* ...}, ... ] }
-    Vid fel: { "error": "text" }
+    Lyckat:  { "results": [ {...}, ... ] }
+    Fel:     { "error": "text" }
     """
-    html = await _open_page(url)
-    rows = _parse_matches(html)
-    if not rows:
-        return {"error": "Inga matcher hittades på sidan."}
-    return {"results": rows}
+    await _ensure_chromium()
+
+    backoffs = [5, 8, 12]  # sekunder
+    last_err = None
+    last_status = None
+
+    for i, pause in enumerate(backoffs, start=1):
+        try:
+            html, status = await _open_and_get_html(url, debug)
+            last_status = status
+
+            low = html.lower()
+            if ("cloudflare" in low or "captcha" in low or "access denied" in low) or (status and status >= 500):
+                last_err = f"Blockerad/5xx (försök {i})."
+                await asyncio.sleep(pause)
+                continue
+
+            rows = _parse(html)
+            if not rows:
+                last_err = "Inga matcher hittades på sidan."
+                await asyncio.sleep(pause if i < len(backoffs) else 0)
+                continue
+
+            return {"results": rows}
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            await asyncio.sleep(pause)
+
+    # efter alla försök
+    msg = last_err or f"Misslyckades efter {len(backoffs)} försök."
+    if last_status:
+        msg += f" (HTTP {last_status})"
+    return {"error": msg}
+
+# kompatibilitet med tidigare importmönster
+run = fetch_kupong
+
+async def fetch_kupong_entry(url: str, debug: bool = False) -> Tuple[Dict[str, Any], int]:
+    out = await fetch_kupong(url, debug=debug)
+    return out, 0
