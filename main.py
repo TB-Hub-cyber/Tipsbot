@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import traceback
+import os, traceback
 
 from models import SvsReq, FootyReq
 from scrape_svspel import fetch_kupong
@@ -12,11 +12,11 @@ from excel_utils import (
     write_excel_bytes,
     reset_state as excel_reset_state,
 )
-import excel_utils  # för /debug/state
+import excel_utils  # exponerar KUPONG/FOOTY i /debug/state
 
 TEMPLATE = "Stryktipsanalys_MASTER.xlsx"
 
-app = FastAPI(title="Stryktips API (no API key)")
+app = FastAPI(title="Stryktips API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -28,44 +28,51 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
+@app.post("/reset")
+def reset():
+    excel_reset_state()
+    return {"ok": True}
+
 @app.post("/svenskaspel")
 async def svenskaspel(req: SvsReq):
     """
-    Hämtar kupongen från Svenska Spel.
-    Returnerar aldrig 500 – utan {ok:false, error:"..."} vid fel så klienten kan logga och fortsätta.
+    Hämta kupongen från Svenska Spel.
+    Returnerar {ok: true, count: N} eller {ok:false, error:"..."}.
     """
     try:
         out = await fetch_kupong(req.url, debug=req.debug)
-        results = out.get("results", []) if isinstance(out, dict) else []
-        if not results:
-            return {"ok": False, "error": "Inga matcher hittades på sidan.", "debug_html_len": len(out.get("debug") or "") if isinstance(out, dict) else 0}
+        if "error" in out:
+            # Skicka mjukt fel till klienten
+            resp = {"ok": False, "error": out["error"]}
+            if req.debug and out.get("debug") is not None:
+                resp["debug_html_len"] = len(out["debug"])
+            return JSONResponse(resp, status_code=200)
+
+        results = out.get("results", [])
         update_kupong(results)
         resp = {"ok": True, "count": len(results)}
-        if req.debug and isinstance(out, dict) and out.get("debug") is not None:
+        if req.debug and out.get("debug") is not None:
             resp["debug_html_len"] = len(out["debug"])
         return resp
     except Exception as e:
-        print("SVS ERROR:", e)
         traceback.print_exc()
         return {"ok": False, "error": str(e)}
 
 @app.post("/footy")
 async def footy(req: FootyReq):
     """
-    Hämtar FootyStats-data för en given länk + matchnr.
-    Returnerar {ok:false, error:"..."} vid fel.
+    Hämta FootyStats för en match.
     """
     try:
         data = await fetch_footy(req.url, debug=req.debug)
         if not isinstance(data, dict) or not data:
-            return {"ok": False, "error": "Ingen data från FootyStats."}
+            return {"ok": False, "matchnr": req.matchnr, "error": "Ingen data från Footy."}
         update_footy(req.matchnr, data)
         resp = {"ok": True, "matchnr": req.matchnr}
         if req.debug and data.get("debug") is not None:
             resp["debug_html_len"] = len(data["debug"])
         return resp
     except Exception as e:
-        print(f"FOOTY ERROR M{req.matchnr}:", e)
         traceback.print_exc()
         return {"ok": False, "matchnr": req.matchnr, "error": str(e)}
 
@@ -81,19 +88,24 @@ def excel_download():
         headers={"Content-Disposition": "attachment; filename=Stryktipsanalys_fylld.xlsx"},
     )
 
-@app.post("/reset")
-def reset():
-    excel_reset_state()
-    return {"ok": True}
-
+# ---------- DEBUG ----------
 @app.get("/debug/state")
 def debug_state():
-    """
-    Visar vad som ligger i minnet just nu.
-    'svenskaspel' = list[dict] med matcher/odds/streck.
-    'footy' = dict: matchnr -> footydata.
-    """
     return {
-        "svenskaspel": excel_utils.KUPONG,
-        "footy": excel_utils.FOOTY,
+        "svenskaspel": excel_utils.KUPONG,  # list[dict]
+        "footy": excel_utils.FOOTY,        # dict[int, dict]
     }
+
+@app.get("/debug/svs-html")
+def debug_svs_html():
+    p = "/tmp/svs_debug.html"
+    if not os.path.exists(p):
+        raise HTTPException(404, "Ingen svs_debug.html ännu – kör /svenskaspel med debug.")
+    return FileResponse(p, media_type="text/html", filename="svs_debug.html")
+
+@app.get("/debug/svs-shot")
+def debug_svs_shot():
+    p = "/tmp/svs_debug.png"
+    if not os.path.exists(p):
+        raise HTTPException(404, "Ingen svs_debug.png ännu – kör /svenskaspel med debug.")
+    return FileResponse(p, media_type="image/png", filename="svs_debug.png")
