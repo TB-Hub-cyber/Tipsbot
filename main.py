@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+import traceback
 
 from models import SvsReq, FootyReq
 from scrape_svspel import fetch_kupong
@@ -29,19 +30,44 @@ def health():
 
 @app.post("/svenskaspel")
 async def svenskaspel(req: SvsReq):
-    out = await fetch_kupong(req.url, debug=req.debug)
-    update_kupong(out["results"])
-    if req.debug and out.get("debug"):
-        return {"count": len(out["results"]), "debug_html_len": len(out["debug"] or "")}
-    return {"count": len(out["results"])}
+    """
+    Hämtar kupongen från Svenska Spel.
+    Returnerar aldrig 500 – utan {ok:false, error:"..."} vid fel så klienten kan logga och fortsätta.
+    """
+    try:
+        out = await fetch_kupong(req.url, debug=req.debug)
+        results = out.get("results", []) if isinstance(out, dict) else []
+        if not results:
+            return {"ok": False, "error": "Inga matcher hittades på sidan.", "debug_html_len": len(out.get("debug") or "") if isinstance(out, dict) else 0}
+        update_kupong(results)
+        resp = {"ok": True, "count": len(results)}
+        if req.debug and isinstance(out, dict) and out.get("debug") is not None:
+            resp["debug_html_len"] = len(out["debug"])
+        return resp
+    except Exception as e:
+        print("SVS ERROR:", e)
+        traceback.print_exc()
+        return {"ok": False, "error": str(e)}
 
 @app.post("/footy")
 async def footy(req: FootyReq):
-    data = await fetch_footy(req.url, debug=req.debug)
-    update_footy(req.matchnr, data)
-    if req.debug and data.get("debug"):
-        return {"ok": True, "debug_html_len": len(data["debug"] or "")}
-    return {"ok": True}
+    """
+    Hämtar FootyStats-data för en given länk + matchnr.
+    Returnerar {ok:false, error:"..."} vid fel.
+    """
+    try:
+        data = await fetch_footy(req.url, debug=req.debug)
+        if not isinstance(data, dict) or not data:
+            return {"ok": False, "error": "Ingen data från FootyStats."}
+        update_footy(req.matchnr, data)
+        resp = {"ok": True, "matchnr": req.matchnr}
+        if req.debug and data.get("debug") is not None:
+            resp["debug_html_len"] = len(data["debug"])
+        return resp
+    except Exception as e:
+        print(f"FOOTY ERROR M{req.matchnr}:", e)
+        traceback.print_exc()
+        return {"ok": False, "matchnr": req.matchnr, "error": str(e)}
 
 @app.get("/excel/download")
 def excel_download():
