@@ -51,4 +51,23 @@ def excel_download():
         raise HTTPException(500, "Template not found")
     return StreamingResponse(
         iter([data]),
-       
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=Stryktipsanalys_fylld.xlsx"},
+    )
+
+@app.post("/reset")
+def reset():
+    excel_reset_state()
+    return {"ok": True}
+
+@app.get("/debug/state")
+def debug_state():
+    """
+    Visar vad som just nu ligger i minnet på servern.
+    'svenskaspel' är listan med matcher/odds/streck.
+    'footy' är en dict: matchnr -> footydata.
+    """
+    return {
+        "svenskaspel": excel_utils.KUPONG,  # list[dict]
+        "footy": excel_utils.FOOTY,        # dict[int, dict]
+    }
