@@ -1,6 +1,6 @@
 fastapi
 uvicorn[standard]
-playwright
+playwright==1.45.0
 beautifulsoup4
 pydantic
 openpyxl
