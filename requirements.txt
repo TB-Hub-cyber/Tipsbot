@@ -4,4 +4,3 @@ playwright==1.45.0
 beautifulsoup4
 pydantic
 openpyxl
-greenlet==2.0.2 --only-binary :all:
