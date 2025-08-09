@@ -1,118 +1,115 @@
-import io
-from typing import Dict, Any, List
+# excel_utils.py – HEL
+from __future__ import annotations
 from openpyxl import load_workbook
-import threading
+from io import BytesIO
+from typing import Dict, Any, List
 
-STATE_LOCK = threading.Lock()
+# ---------------- Debug-state ----------------
 KUPONG: List[Dict[str, Any]] = []
 FOOTY: Dict[int, Dict[str, Any]] = {}
 
-def write_excel_bytes(template_path: str) -> bytes:
-    with open(template_path, "rb") as f:
-        base_bytes = f.read()
-    bio_in = io.BytesIO(base_bytes)
-    wb = load_workbook(bio_in)
-    ws = wb["Data"]
+def reset_state():
+    global KUPONG, FOOTY
+    KUPONG = []
+    FOOTY = {}
 
-    header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-    idx = {name: i+1 for i, name in enumerate(header)}
+# ----------- Kolumnlayout (1-baserad) ----------
+# Justera dessa så de stämmer mot din mall.
+# A=1, B=2, ...
+COLS = {
+    "matchnr": 1,       # A
+    "hemmalag": 2,      # B
+    "bortalag": 3,      # C
+    "odds_1": 4,        # D
+    "odds_x": 5,        # E
+    "odds_2": 6,        # F
+    "folk_1": 7,        # G
+    "folk_x": 8,        # H
+    "folk_2": 9,        # I
+    "spelv_1": 10,      # J (om du saknar kolumnerna, sätt till None)
+    "spelv_x": 11,      # K
+    "spelv_2": 12,      # L
+}
+START_ROW = 2          # första dataraden
+SHEET_NAME = None      # None = aktiv flik; annars t.ex. "Stryktips"
 
-    def col(*names):
-        for n in names:
-            if n in idx: return idx[n]
-        return None
+# --------- Hjälpare ----------
+def _put(ws, row: int, key: str, value):
+    col = COLS.get(key)
+    if col:
+        ws.cell(row=row, column=col, value=value)
 
-    C_MATCH = col("Match", "Matchnr")
-    C_HOME  = col("Hemmalag")
-    C_AWAY  = col("Bortalag")
-    C_F1 = col("Folkets val 1")
-    C_FX = col("Folkets val X")
-    C_F2 = col("Folkets val 2")
-    C_O1 = col("Odds 1")
-    C_OX = col("Odds X")
-    C_O2 = col("Odds 2")
+def _pick(d: dict, *names, default=None):
+    for n in names:
+        if n in d and d[n] is not None:
+            return d[n]
+    return default
 
-    FOOTY_MAP = [
-        ("xG H (overall)", ("xG","H","overall")),
-        ("xG H (hemma)",   ("xG","H","home")),
-        ("xGA H (overall)",("xGA","H","overall")),
-        ("xGA H (hemma)",  ("xGA","H","home")),
-        ("Gjorda mål/sn H (overall)", ("scored","H","overall")),
-        ("Insläppta/sn H (overall)",  ("conceded","H","overall")),
+# --------- API som kallas från main.py ----------
+def update_kupong(rows: List[Dict[str, Any]]):
+    """
+    Tar listan från scrapen (13 rader) och normaliserar nycklarna.
+    Vi skriver inte till fil här – vi sparar i KUPONG och låter
+    write_excel_bytes() göra själva skrivningen när du hämtar Excel.
+    """
+    global KUPONG
+    KUPONG = []
 
-        ("xG B (overall)", ("xG","B","overall")),
-        ("xG B (borta)",   ("xG","B","away")),
-        ("xGA B (overall)",("xGA","B","overall")),
-        ("xGA B (borta)",  ("xGA","B","away")),
-        ("Gjorda mål/sn B (overall)", ("scored","B","overall")),
-        ("Insläppta/sn B (overall)",  ("conceded","B","overall")),
-
-        ("PPG H (overall)", ("ppg","H","overall")),
-        ("PPG H (hemma)",   ("ppg","H","home")),
-        ("PPG B (overall)", ("ppg","B","overall")),
-        ("PPG B (borta)",   ("ppg","B","away")),
-
-        ("Form H (senaste 5)", ("form","H","last5")),
-        ("Hemmaform H (senaste 5)", ("form","H","home5")),
-        ("Bortaform H (senaste 5)", ("form","H","away5")),
-        ("Form B (senaste 5)", ("form","B","last5")),
-        ("Hemmaform B (senaste 5)", ("form","B","home5")),
-        ("Bortaform B (senaste 5)", ("form","B","away5")),
-        ("H2H senaste 5", ("h2h","txt","5")),
-    ]
-
-    match_to_row = {}
-    for row in ws.iter_rows(min_row=2, values_only=False):
-        try:
-            m = int(row[C_MATCH-1].value)
-            match_to_row[m] = row[0].row
-        except Exception:
-            pass
-
-    with STATE_LOCK:
-        for item in KUPONG:
-            r = match_to_row.get(item.get("match"))
-            if not r: continue
-            if C_HOME: ws.cell(r, C_HOME, item.get("home"))
-            if C_AWAY: ws.cell(r, C_AWAY, item.get("away"))
-            if C_F1: ws.cell(r, C_F1, item.get("folkets_1"))
-            if C_FX: ws.cell(r, C_FX, item.get("folkets_x"))
-            if C_F2: ws.cell(r, C_F2, item.get("folkets_2"))
-            if C_O1: ws.cell(r, C_O1, item.get("odds_1"))
-            if C_OX: ws.cell(r, C_OX, item.get("odds_x"))
-            if C_O2: ws.cell(r, C_O2, item.get("odds_2"))
-
-        for mnr, data in FOOTY.items():
-            r = match_to_row.get(mnr)
-            if not r: continue
-            for colname, path in FOOTY_MAP:
-                c = idx.get(colname)
-                if not c: continue
-                bucket, side, key = path
-                val = None
-                if bucket in ("xG","xGA"):
-                    val = data.get(bucket, {}).get(side, {}).get(key)
-                elif bucket in ("scored","conceded","ppg","form"):
-                    val = data.get(bucket, {}).get(side, {}).get(key)
-                elif bucket == "h2h":
-                    val = data.get("h2h", {}).get("txt")
-                if val is not None:
-                    ws.cell(r, c, val)
-
-    bio_out = io.BytesIO()
-    wb.save(bio_out)
-    return bio_out.getvalue()
-
-def update_kupong(items: list):
-    with STATE_LOCK:
-        global KUPONG
-        KUPONG = items
+    for i, r in enumerate(rows[:13], start=1):
+        KUPONG.append({
+            "matchnr": _pick(r, "matchnr", default=i),
+            "hemmalag": _pick(r, "hemmalag", "home"),
+            "bortalag": _pick(r, "bortalag", "away"),
+            "odds_1": _pick(r, "odds_1", "odds1"),
+            "odds_x": _pick(r, "odds_x", "oddsx"),
+            "odds_2": _pick(r, "odds_2", "odds2"),
+            "folk_1": _pick(r, "folk_1", "folk1"),
+            "folk_x": _pick(r, "folk_x", "folkx"),
+            "folk_2": _pick(r, "folk_2", "folk2"),
+            "spelv_1": _pick(r, "spelv_1"),
+            "spelv_x": _pick(r, "spelv_x"),
+            "spelv_2": _pick(r, "spelv_2"),
+        })
 
 def update_footy(matchnr: int, data: Dict[str, Any]):
-    with STATE_LOCK:
-        FOOTY[matchnr] = data
+    """Valfri: spara FootyStats-data per matchnr (för din andra flik)."""
+    FOOTY[matchnr] = data or {}
 
-def reset_state():
-    with STATE_LOCK:
-        KUPONG.clear()
-        FOOTY.clear()
+def write_excel_bytes(template_path: str) -> bytes:
+    """
+    Öppnar mallen, skriver KUPONG (och ev. FOOTY), och returnerar filen som bytes.
+    """
+    wb = load_workbook(template_path)
+    ws = wb[SHEET_NAME] if SHEET_NAME and SHEET_NAME in wb.sheetnames else wb.active
+
+    # Skriv kupongen
+    for i, r in enumerate(KUPONG, start=0):
+        row = START_ROW + i
+        _put(ws, row, "matchnr", r.get("matchnr"))
+        _put(ws, row, "hemmalag", r.get("hemmalag"))
+        _put(ws, row, "bortalag", r.get("bortalag"))
+        _put(ws, row, "odds_1", r.get("odds_1"))
+        _put(ws, row, "odds_x", r.get("odds_x"))
+        _put(ws, row, "odds_2", r.get("odds_2"))
+        _put(ws, row, "folk_1", r.get("folk_1"))
+        _put(ws, row, "folk_x", r.get("folk_x"))
+        _put(ws, row, "folk_2", r.get("folk_2"))
+        _put(ws, row, "spelv_1", r.get("spelv_1"))
+        _put(ws, row, "spelv_x", r.get("spelv_x"))
+        _put(ws, row, "spelv_2", r.get("spelv_2"))
+
+    # (Valfritt) skriv FOOTY på en separat flik om du har en sådan.
+    # Exempel, om din fil har en flik "Footy" och kolumner:
+    #   A=Matchnr, B=Hemma xG, C=Borta xG, D=H2H osv.
+    # if "Footy" in wb.sheetnames and FOOTY:
+    #     wf = wb["Footy"]
+    #     for mn, data in FOOTY.items():
+    #         row = START_ROW - 1 + mn
+    #         wf.cell(row=row, column=1, value=mn)
+    #         wf.cell(row=row, column=2, value=data.get("xg_home"))
+    #         wf.cell(row=row, column=3, value=data.get("xg_away"))
+    #         # ... osv
+
+    bio = BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
