@@ -1,7 +1,10 @@
+# -*- coding: utf-8 -*-
+# main.py – FastAPI-backend som anropas från Pythonista-klienten.
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import os, traceback, asyncio
+import os, asyncio, traceback
 
 from models import SvsReq, FootyReq
 from scrape_svspel import fetch_kupong
@@ -15,6 +18,8 @@ from excel_utils import (
 import excel_utils  # för /debug/state
 
 TEMPLATE = "Stryktipsanalys_MASTER.xlsx"
+PW_CACHE = "/opt/render/.cache/ms-playwright"
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PW_CACHE)
 
 app = FastAPI(title="Stryktips API")
 
@@ -24,42 +29,30 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"],
 )
 
-# ---------- Självläkning av Playwright/Chromium ----------
-PW_CACHE = "/opt/render/.cache/ms-playwright"
+# ---- Självläkning av Playwright/Chromium vid uppstart ----
+async def _chromium_present() -> bool:
+    if not os.path.isdir(PW_CACHE):
+        return False
+    for root, dirs, files in os.walk(PW_CACHE):
+        if "chrome" in files:
+            return True
+    return False
 
 async def _install_chromium():
-    # Kör "python -m playwright install chromium"
     proc = await asyncio.create_subprocess_exec(
         "python", "-m", "playwright", "install", "chromium",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
     out, err = await proc.communicate()
-    return proc.returncode, out.decode(errors="ignore"), err.decode(errors="ignore")
-
-async def _chromium_ok():
-    # Liten sanity check: finns chrome-bin någonstans i cache?
-    for root, dirs, files in os.walk(PW_CACHE):
-        if "chrome" in files or "chrome-linux" in root:
-            return True
-    return False
+    if proc.returncode != 0:
+        print("[startup] playwright install chromium failed:", err.decode(errors="ignore"))
+    else:
+        print("[startup] playwright chromium installed.")
 
 @app.on_event("startup")
-async def ensure_playwright_ready():
-    # Sätt sökvägen (hjälper Playwright hitta browsern mellan builds)
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PW_CACHE)
-
-    # Om cache ser tom ut – försök installera
-    if not await _chromium_ok():
-        rc, out, err = await _install_chromium()
-        if rc != 0:
-            # Sista försök: ibland hjälper ett andra körning
-            rc2, out2, err2 = await _install_chromium()
-            if rc2 != 0:
-                print("Playwright install failed:", err or err2)
-            else:
-                print("Playwright installed on retry.")
-        else:
-            print("Playwright Chromium installed at startup.")
+async def startup():
+    if not await _chromium_present():
+        await _install_chromium()
 
 @app.get("/health")
 def health():
@@ -72,20 +65,19 @@ def reset():
 
 @app.post("/svenskaspel")
 async def svenskaspel(req: SvsReq):
+    """
+    Hämtar kupongen. Returnerar {ok:true,count:N} eller {ok:false,error:"..."}.
+    """
     try:
         out = await fetch_kupong(req.url, debug=req.debug)
         if "error" in out:
             resp = {"ok": False, "error": out["error"]}
-            if req.debug and out.get("debug") is not None:
-                resp["debug_html_len"] = len(out["debug"])
             return JSONResponse(resp, status_code=200)
 
         results = out.get("results", [])
+        # Uppdatera Excel-state (tål att folk_* är None)
         update_kupong(results)
-        resp = {"ok": True, "count": len(results)}
-        if req.debug and out.get("debug") is not None:
-            resp["debug_html_len"] = len(out["debug"])
-        return resp
+        return {"ok": True, "count": len(results)}
     except Exception as e:
         traceback.print_exc()
         return {"ok": False, "error": str(e)}
@@ -117,24 +109,11 @@ def excel_download():
         headers={"Content-Disposition": "attachment; filename=Stryktipsanalys_fylld.xlsx"},
     )
 
-# ---------- DEBUG ----------
+# ---- DEBUG ----
 @app.get("/debug/state")
 def debug_state():
-    return {
-        "svenskaspel": excel_utils.KUPONG,
-        "footy": excel_utils.FOOTY,
-    }
+    return {"svenskaspel": excel_utils.KUPONG, "footy": excel_utils.FOOTY}
 
-@app.get("/debug/svs-html")
-def debug_svs_html():
-    p = "/tmp/svs_debug.html"
-    if not os.path.exists(p):
-        raise HTTPException(404, "Ingen svs_debug.html ännu – kör /svenskaspel med debug.")
-    return FileResponse(p, media_type="text/html", filename="svs_debug.html")
-
-@app.get("/debug/svs-shot")
-def debug_svs_shot():
-    p = "/tmp/svs_debug.png"
-    if not os.path.exists(p):
-        raise HTTPException(404, "Ingen svs_debug.png ännu – kör /svenskaspel med debug.")
-    return FileResponse(p, media_type="image/png", filename="svs_debug.png")
+@app.get("/")
+def root():
+    return {"service": "tipsbot", "status": "ok"}
