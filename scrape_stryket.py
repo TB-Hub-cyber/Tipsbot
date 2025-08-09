@@ -1,20 +1,12 @@
 # -*- coding: utf-8 -*-
-# scrape_stryket.py – hämtar veckans kupong från https://www.stryketanalysen.se/stryktipset/
-# Fält per match:
-#   matchnr, hemmalag, bortalag,
-#   odds_1, odds_x, odds_2,
-#   folk_1, folk_x, folk_2,
-#   spelv_1, spelv_x, spelv_2  (kan vara None om ej visat)
-#
-# Returnerar {"results":[...]} eller {"error":"..."}.
-# Kräver Playwright (chromium) installerat i miljön.
+# Async-scraper för https://www.stryketanalysen.se/stryktipset/
 
 from typing import Dict, Any, List, Optional, Iterable
 import re
 from bs4 import BeautifulSoup, Tag, NavigableString
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
-# ----------------------------- Regex & helpers ------------------------------
+# ---------- Regex & helpers ----------
 
 NAME = r"[A-Za-zÅÄÖåäö0-9\.\-’'&() ]+"
 TITLE_RX = re.compile(fr"({NAME})\s*-\s*({NAME})")
@@ -41,13 +33,13 @@ def _section_after_label(text: str, label: str) -> str:
     i = text.find(label)
     if i < 0:
         return ""
-    rest = text[i+len(label):]
-    stop_idx = len(rest)
+    rest = text[i + len(label):]
+    stop = len(rest)
     for lb in LABELS_ORDER:
         j = rest.find(lb)
         if j >= 0:
-            stop_idx = min(stop_idx, j)
-    return rest[:stop_idx]
+            stop = min(stop, j)
+    return rest[:stop]
 
 def _pick_three_floats(text: str):
     nums = NUM_RX.findall(text)
@@ -64,8 +56,6 @@ def _pick_three_pcts(text: str):
     return vals
 
 def _nearest_match_container(node: Tag) -> Optional[Tag]:
-    """Från en label-nod (t.ex. 'Svenska folket') klättra uppåt tills vi hittar ett block
-    som även innehåller titel 'Lag - Lag' och texten 'Odds'."""
     cur: Optional[Tag] = node
     for _ in range(8):
         if cur is None:
@@ -76,13 +66,13 @@ def _nearest_match_container(node: Tag) -> Optional[Tag]:
         cur = cur.parent if isinstance(cur.parent, Tag) else None
     return None
 
-# ------------------------------- Parser -------------------------------------
+# ---------- Parser ----------
 
 def _parse(html: str) -> List[Dict[str, Any]]:
     soup = BeautifulSoup(html, "html.parser")
     results: List[Dict[str, Any]] = []
 
-    # Primär: hitta varje matchruta via labeln "Svenska folket"
+    # Primär: hitta via labeln "Svenska folket"
     folk_labels: Iterable[Tag] = soup.find_all(string=re.compile(r"^\s*Svenska folket\s*$", re.I))
     containers: List[Tag] = []
     for lbl in folk_labels:
@@ -91,7 +81,7 @@ def _parse(html: str) -> List[Dict[str, Any]]:
         if cont and cont not in containers:
             containers.append(cont)
 
-    # Fallback 1: generiska block som innehåller titel + Odds + Svenska folket
+    # Fallback 1: generiska block
     if not containers:
         for blk in soup.select(".content div, .entry-content div, li, article, .match, .match-row"):
             if not isinstance(blk, Tag):
@@ -107,7 +97,6 @@ def _parse(html: str) -> List[Dict[str, Any]]:
             if "Odds" in txt and TITLE_RX.search(txt):
                 containers.append(tr)
 
-    # Plocka fält ur respektive container
     for cont in containers:
         txt = " ".join(cont.stripped_strings)
 
@@ -133,7 +122,7 @@ def _parse(html: str) -> List[Dict[str, Any]]:
             "spelv_1": s1, "spelv_x": sx, "spelv_2": s2,
         })
 
-    # Deduplicera + sätt matchnr 1..13
+    # Deduplicera och numrera 1..13
     seen = set()
     unique: List[Dict[str, Any]] = []
     for r in results:
@@ -149,78 +138,68 @@ def _parse(html: str) -> List[Dict[str, Any]]:
 
     return unique[:13]
 
-# ------------------------------- Scraper ------------------------------------
+# ---------- Async Playwright-scrape ----------
 
-def fetch_stryket(url_obj, debug: bool = False) -> Dict[str, Any]:
+async def fetch_stryket(url_obj, debug: bool = False) -> Dict[str, Any]:
     """
-    Synkront anrop – användbart direkt från main.py.
-    Renderar sidan med Playwright (Chromium), väntar in texten 'Svenska folket',
-    scrollar för att trigga ev. lazyload, sparar debug-HTML/screenshot om debug=True,
-    och parser sedan hela DOM:en.
+    Kör Playwrights Async-API, väntar in innehåll + scrollar, sparar debug,
+    och parser HTML till 13 matcher.
     """
     url = str(url_obj).strip()
     if not url:
         return {"error": "Ingen URL angiven."}
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
                 headless=True,
-                args=[
-                    "--no-sandbox", "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage", "--disable-gpu",
-                ],
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
             )
-            ctx = browser.new_context(user_agent=(
+            ctx = await browser.new_context(user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0 Safari/537.36"
             ))
-            page = ctx.new_page()
+            page = await ctx.new_page()
 
-            page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
 
-            # Vänta in att matchblocken finns (texten "Svenska folket" räcker)
+            # Vänta in att matchrutor finns (”Svenska folket” eller i sista hand ”Odds”)
             try:
-                page.wait_for_selector(":text('Svenska folket')", timeout=25_000)
+                await page.wait_for_selector(":text('Svenska folket')", timeout=25_000)
             except Exception:
-                # Sista chans: försök vänta in "Odds"
-                page.wait_for_selector(":text('Odds')", timeout=10_000)
+                await page.wait_for_selector(":text('Odds')", timeout=10_000)
 
-            # Scrolla igenom sidan för att trigga ev. lazyload
-            page.evaluate(
+            # Scrolla genom sidan för att trigga ev. lazyload
+            await page.evaluate(
                 """() => new Promise(res => {
-                    let y = 0, step = 1000, limit = 8, i=0;
+                    let y = 0, step = 1200, limit = 10, i = 0;
                     const t = setInterval(() => {
                         window.scrollBy(0, step); y += step; i += 1;
-                        if (i >= limit || y > document.body.scrollHeight*2) {
-                            clearInterval(t); setTimeout(res, 800);
+                        if (i >= limit || y > document.body.scrollHeight * 2) {
+                            clearInterval(t); setTimeout(res, 900);
                         }
                     }, 250);
                 })"""
             )
 
-            # Liten extra paus för att data ska hinna renderas
-            page.wait_for_timeout(800)
-
-            html = page.content()
+            await page.wait_for_timeout(900)
+            html = await page.content()
 
             if debug:
                 try:
-                    page.screenshot(path="/tmp/stryket_debug.png", full_page=True)
+                    await page.screenshot(path="/tmp/stryket_debug.png", full_page=True)
                     with open("/tmp/stryket_debug.html", "w", encoding="utf-8") as f:
                         f.write(html)
                 except Exception:
                     pass
 
-            browser.close()
+            await browser.close()
 
         rows = _parse(html)
         if not rows:
             return {"error": "Hittade inga matcher på sidan."}
-
         return {"results": rows}
 
     except Exception as e:
-        # Returnera kontrollerat fel (snarare än att låta det bubbla upp)
         return {"error": str(e)}
