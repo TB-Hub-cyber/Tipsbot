@@ -1,108 +1,187 @@
-# main.py
-from __future__ import annotations
-from typing import Any, Dict, List, Optional
+# main.py — FastAPI backend för Tipsbot (Render)
+# - Hämtar Stryktips-data från Stryketanalysen (scrape_stryket.fetch_stryket)
+# - Exponerar /svenskaspel, /excel, /health, /reset, /debug/state
+# - Tjänar /debug/stryket.html via static mount
 
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import List, Dict, Any
+from datetime import datetime
+import io
+import os
+import pathlib
 
-# Egna moduler
-from scrape_stryket import scrape_stryketanalysen          # returnerar list[dict] för 13 matcher
-from scrape_footy import fetch_footy                       # returnerar dict med Footy-fält
-from excel_utils import update_kupong, update_footy        # skriver in i Stryktipsanalys_MASTER.xlsx
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
+# ---- importera vår scraper ----
+from scrape_stryket import fetch_stryket, DEBUG_HTML_PATH, STATIC_DIR
+
+# ---------------------------------
+# App & CORS
+# ---------------------------------
 app = FastAPI(title="Tipsbot API", version="1.0.0")
 
-# Tillåt att din iPad-klient anropar
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],           # låt vara öppet för enkelhet
+    allow_origins=["*"],   # öppet för enkelhet (kan låsas till pythonistas origin)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# se till att static-katalogen finns och mounta
+STATIC_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Bekväm alias för debug-HTML (så du kan öppna /debug/stryket.html)
+@app.get("/debug/stryket.html")
+def debug_stryket_html_redirect():
+    # Render har redan mountat /static – men vi ger en enkel redirect-lösning
+    if DEBUG_HTML_PATH.exists():
+        return Response(
+            content=(DEBUG_HTML_PATH.read_text(encoding="utf-8")),
+            media_type="text/html; charset=utf-8",
+            status_code=200
+        )
+    return Response(content="Ingen debug-HTML sparad ännu.", media_type="text/plain; charset=utf-8", status_code=404)
+
+# ---------------------------------
+# State i minne
+# ---------------------------------
+STATE: Dict[str, Any] = {
+    "last_url": None,
+    "last_fetch_ts": None,
+    "svenskaspel": [],   # list[dict] med 13 matcher
+}
+
+# ---------------------------------
+# Models
+# ---------------------------------
+class SvsReq(BaseModel):
+    url: str
+    debug: bool = False
+    footy: List[str] = []   # reserverad; används ej här ännu
+
+# ---------------------------------
+# Hjälp: skapa Excel i minne
+# ---------------------------------
+EXCEL_COLUMNS = [
+    ("Matchnr", 8),
+    ("Hemmalag", 22),
+    ("Bortalag", 22),
+    ("Odds_1", 10),
+    ("Odds_X", 10),
+    ("Odds_2", 10),
+    ("Folk_1 (%)", 12),
+    ("Folk_X (%)", 12),
+    ("Folk_2 (%)", 12),
+    ("Spelvärde_1", 12),
+    ("Spelvärde_X", 12),
+    ("Spelvärde_2", 12),
+]
+
+def build_excel(data: List[Dict[str, Any]]) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Kupong"
+
+    # rubriker
+    for col_idx, (title, width) in enumerate(EXCEL_COLUMNS, start=1):
+        c = ws.cell(row=1, column=col_idx, value=title)
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # rader
+    row_idx = 2
+    for row in data:
+        ws.cell(row=row_idx, column=1,  value=row.get("matchnr"))
+        ws.cell(row=row_idx, column=2,  value=row.get("hemmalag"))
+        ws.cell(row=row_idx, column=3,  value=row.get("bortalag"))
+        ws.cell(row=row_idx, column=4,  value=row.get("odds_1"))
+        ws.cell(row=row_idx, column=5,  value=row.get("odds_x"))
+        ws.cell(row=row_idx, column=6,  value=row.get("odds_2"))
+        ws.cell(row=row_idx, column=7,  value=row.get("folk_1"))
+        ws.cell(row=row_idx, column=8,  value=row.get("folk_x"))
+        ws.cell(row=row_idx, column=9,  value=row.get("folk_2"))
+        ws.cell(row=row_idx, column=10, value=row.get("spelv_1"))
+        ws.cell(row=row_idx, column=11, value=row.get("spelv_x"))
+        ws.cell(row=row_idx, column=12, value=row.get("spelv_2"))
+        row_idx += 1
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    return bio.getvalue()
+
+# ---------------------------------
+# Endpoints
+# ---------------------------------
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health():
+    return {"ok": True, "ts": datetime.utcnow().isoformat()}
+
+@app.post("/reset")
+def reset():
+    STATE["last_url"] = None
+    STATE["last_fetch_ts"] = None
+    STATE["svenskaspel"] = []
+    # töm debug-html
+    try:
+        if DEBUG_HTML_PATH.exists():
+            DEBUG_HTML_PATH.unlink()
+    except Exception:
+        pass
     return {"ok": True}
 
+@app.get("/debug/state")
+def debug_state():
+    return {
+        "last_url": STATE["last_url"],
+        "last_fetch_ts": STATE["last_fetch_ts"],
+        "svenskaspel_rows": len(STATE["svenskaspel"]),
+        "debug_html_exists": DEBUG_HTML_PATH.exists(),
+    }
+
 @app.post("/svenskaspel")
-def post_svenskaspel(
-    url: Optional[str] = Body(default=None),
-    svenskaspel: Optional[List[Dict[str, Any]]] = Body(default=None),
-) -> Dict[str, Any]:
-    """
-    Anropa på två sätt:
+def svenskaspel(req: SvsReq):
+    try:
+        # just nu: endast Stryketanalysen-vägen
+        if "stryketanalysen.se" in (req.url or ""):
+            result = fetch_stryket(req.url, debug=req.debug)
+        else:
+            raise HTTPException(status_code=400, detail="Okänd URL-källa. Ange Stryketanalysen-URL.")
 
-    1) Scrapa Stryketanalysen:
-       POST /svenskaspel
-       {"url":"https://stryketanalysen.se/stryktipset/"}
+        rows = result.get("svenskaspel") or []
+        if not rows:
+            raise HTTPException(status_code=502, detail="Scrape-fel: tomt resultat.")
 
-    2) Skicka data direkt från klienten:
-       POST /svenskaspel
-       {"svenskaspel":[ {...}, {...} ]}
-    """
-    if svenskaspel:
-        try:
-            update_kupong(svenskaspel)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Excel-fel: {e}")
-        return {"ok": True, "n": len(svenskaspel), "mode": "direct"}
+        # spara i state
+        STATE["svenskaspel"] = rows[:13]  # säkerställ 13 rader
+        STATE["last_url"] = req.url
+        STATE["last_fetch_ts"] = datetime.utcnow().isoformat()
 
-    if url:
-        try:
-            rows = scrape_stryketanalysen(url)
-        except Exception as e:
-            # bubbla upp tydligt felmeddelande till klienten
-            raise HTTPException(status_code=502, detail=f"Scrape-fel: {e}")
-        try:
-            update_kupong(rows)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Excel-fel: {e}")
-        return {"ok": True, "n": len(rows), "mode": "scraped"}
+        return {"svenskaspel": STATE["svenskaspel"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        # om scrape_stryket kastar fel hamnar vi här
+        raise HTTPException(status_code=502, detail=str(e))
 
-    raise HTTPException(status_code=422, detail="Skicka {svenskaspel:[...]} ELLER {url:'...'}.")
+@app.get("/excel")
+def excel():
+    rows = STATE["svenskaspel"]
+    if not rows:
+        raise HTTPException(status_code=404, detail="Ingen kupongdata i minnet ännu. Kör /svenskaspel först.")
 
-@app.post("/footy")
-def post_footy(items: List[Dict[str, Any]] = Body(...)) -> Dict[str, Any]:
-    """
-    Example body:
-    [
-      {"matchnr": 1, "url": "https://footystats.org/england/...-h2h-stats"},
-      {"matchnr": 2, "url": "https://footystats.org/england/...-h2h-stats"}
-    ]
-    """
-    results: List[Dict[str, Any]] = []
-    written = 0
+    content = build_excel(rows)
+    filename = f"Stryktipsanalys_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+    return Response(content=content, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers=headers)
 
-    if not isinstance(items, list) or not items:
-        raise HTTPException(status_code=422, detail="Skicka en icke-tom lista med objekt {matchnr, url}.")
-
-    for it in items:
-        matchnr = it.get("matchnr")
-        url = it.get("url")
-        if not matchnr or not url:
-            results.append({"ok": False, "error": "saknar matchnr/url", "item": it})
-            continue
-
-        try:
-            data = fetch_footy(url)              # hämta och tolka Footy-sidan
-            update_footy(matchnr, data)          # skriv till Excel på raden för matchnr
-            results.append({"ok": True, "matchnr": matchnr})
-            written += 1
-        except Exception as e:
-            results.append({"ok": False, "matchnr": matchnr, "error": str(e)})
-
-    if written == 0:
-        # om allt misslyckades – returnera 502 med detaljer för felsökning
-        raise HTTPException(status_code=502, detail={"items": results})
-
-    return {"ok": True, "written": written, "items": results}
-
-# Valfritt: root svarar 404 för att indikera att API:et inte har startsida
+# valfri root
 @app.get("/")
-def root() -> Dict[str, Any]:
-    return {"detail": "Tipsbot API – använd /health, /svenskaspel eller /footy."}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=False)
+def root():
+    return {"service": "tipsbot", "status": "ok"}
