@@ -2,85 +2,87 @@
 from __future__ import annotations
 import io
 import re
-import datetime as dt
 from typing import List, Dict, Any, Optional
 from openpyxl import load_workbook
 
-# Global state (fylls av API:et)
+# ---- Global state (fylls via API:t) ----
 KUPONG: List[Dict[str, Any]] = []
 FOOTY: Dict[int, Dict[str, Any]] = {}
 
 DATA_SHEET_NAME = "Data"
-START_ROW = 2  # rad där match 1 står
+START_ROW = 2  # Match 1 ligger på rad 2
 
-# ---------- Helpers ----------
 def reset_state():
     KUPONG.clear()
     FOOTY.clear()
 
 def update_kupong(rows: List[Dict[str, Any]]):
-    """Spara kupongrader."""
     global KUPONG
     KUPONG = list(rows or [])
 
 def update_footy(matchnr: int, data: Dict[str, Any]):
-    """Spara footydata per match."""
     FOOTY[int(matchnr)] = data
 
 def _open_wb(path: str):
     return load_workbook(path)
 
-def _find_sheet(wb, name: str):
-    if name in wb.sheetnames:
-        return wb[name]
-    # fallback: aktivt blad
-    return wb.active
+def _sheet(wb, name: str):
+    return wb[name] if name in wb.sheetnames else wb.active
 
-def find_col_by_header(ws, patterns):
-    """
-    patterns: str eller lista av regex som matchar headertext i rad 1.
-    Returnerar kolumnindex (1-baserat) eller None.
-    """
-    if isinstance(patterns, str):
-        patterns = [patterns]
-    headers = {}
+def _find_col(ws, exact_header: str) -> Optional[int]:
     for c in range(1, ws.max_column + 1):
-        txt = ws.cell(row=1, column=c).value
-        if isinstance(txt, str):
-            headers[c] = txt.strip()
-    for rx in patterns:
-        cre = re.compile(rx, re.I)
-        for c, txt in headers.items():
-            if cre.search(txt):
-                return c
+        v = ws.cell(row=1, column=c).value
+        if isinstance(v, str) and v.strip() == exact_header:
+            return c
     return None
 
-# ---------- Skriv KUPONG till Data (om kolumner hittas) ----------
-KUPONG_MAP = {
-    # rubrik_regex : lambda row -> value
-    r"^Matchnr": lambda r: r.get("matchnr"),
-    r"^Hemmalag": lambda r: r.get("hemmalag"),
-    r"^Bortalag": lambda r: r.get("bortalag"),
-    r"^Odds\s*%?\s*1|^Odds\s*1\b": lambda r: r.get("odds_1"),
-    r"^Odds\s*%?\s*X|^Odds\s*X\b": lambda r: r.get("odds_x"),
-    r"^Odds\s*%?\s*2|^Odds\s*2\b": lambda r: r.get("odds_2"),
-    r"(Svenska\s*folket|Folk).*\b1\b": lambda r: r.get("folk_1"),
-    r"(Svenska\s*folket|Folk).*\bX\b": lambda r: r.get("folk_x"),
-    r"(Svenska\s*folket|Folk).*\b2\b": lambda r: r.get("folk_2"),
-    r"^V(a|ä)rde\s*1": lambda r: r.get("spelv_1"),
-    r"^V(a|ä)rde\s*X": lambda r: r.get("spelv_x"),
-    r"^V(a|ä)rde\s*2": lambda r: r.get("spelv_2"),
-}
+# --------- Exakta rubriker enligt din fil ---------
+# Kupong
+COL_MATCH         = "Match"
+COL_HOME          = "Hemmalag"
+COL_AWAY          = "Bortalag"
+COL_ODDS_1        = "Odds 1"
+COL_ODDS_X        = "Odds X"
+COL_ODDS_2        = "Odds 2"
+COL_FOLK_1        = "Folkets val 1"
+COL_FOLK_X        = "Folkets val X"
+COL_FOLK_2        = "Folkets val 2"
+COL_SV_1          = "Spelvärde 1"
+COL_SV_X          = "Spelvärde X"
+COL_SV_2          = "Spelvärde 2"
+
+# Footy
+COL_FORM_H        = "Form H (senaste 5)"
+COL_FORM_B        = "Form B (senaste 5)"
+COL_H2H_5         = "H2H senaste 5"
+COL_XG_H_OV       = "xG H (overall)"
+COL_XGA_H_OV      = "xGA H (overall)"
+COL_XG_B_OV       = "xG B (overall)"
+COL_XGA_B_OV      = "xGA B (overall)"
+COL_PPG_H_OV      = "PPG H (overall)"
+COL_PPG_B_OV      = "PPG B (overall)"
+
+def _set_if_not_none(ws, row: int, col: Optional[int], value):
+    if col and value is not None:
+        ws.cell(row=row, column=col, value=value)
 
 def write_kupong_into_data_sheet(wb):
     if not KUPONG:
         return
-    ws = _find_sheet(wb, DATA_SHEET_NAME)
+    ws = _sheet(wb, DATA_SHEET_NAME)
 
-    # bygg kolumnkarta en gång
-    col_map = {}
-    for hdr_regex in KUPONG_MAP:
-        col_map[hdr_regex] = find_col_by_header(ws, hdr_regex)
+    c_match = _find_col(ws, COL_MATCH)
+    c_home  = _find_col(ws, COL_HOME)
+    c_away  = _find_col(ws, COL_AWAY)
+    c_o1    = _find_col(ws, COL_ODDS_1)
+    c_ox    = _find_col(ws, COL_ODDS_X)
+    c_o2    = _find_col(ws, COL_ODDS_2)
+    c_f1    = _find_col(ws, COL_FOLK_1)
+    c_fx    = _find_col(ws, COL_FOLK_X)
+    c_f2    = _find_col(ws, COL_FOLK_2)
+    c_sv1   = _find_col(ws, COL_SV_1)
+    c_svx   = _find_col(ws, COL_SV_X)
+    c_sv2   = _find_col(ws, COL_SV_2)
 
     for r in KUPONG:
         try:
@@ -88,62 +90,59 @@ def write_kupong_into_data_sheet(wb):
         except Exception:
             continue
         row = START_ROW - 1 + mn
-        for hdr_regex, maker in KUPONG_MAP.items():
-            c = col_map.get(hdr_regex)
-            if not c:
-                continue
-            try:
-                val = maker(r)
-            except Exception:
-                val = None
-            ws.cell(row=row, column=c, value=val)
 
-# ---------- Skriv FOOTY till Data ----------
-FOOTY_TO_DATA_MAP = {
-    r"^Form\s*H\b|Hemmaform": lambda d: (d.get("home") or {}).get("form_last5"),
-    r"^Form\s*B\b|Bortaform": lambda d: (d.get("away") or {}).get("form_last5"),
-    r"H2H.*(senaste|last)\s*5": lambda d: (
-        "W:{W} D:{D} L:{L}".format(**{k: (d.get("h2h_last5") or {}).get(k) for k in ["W","D","L"]})
-    ),
-    r"^xG\s*H\b.*(s(a|ä)song|overall)|^xG H": lambda d: (d.get("home") or {}).get("xg_for"),
-    r"^xGA\s*H\b|xG\s*H\s*\(hemma\)|xG-against H": lambda d: (d.get("home") or {}).get("xg_against"),
-    r"^PPG\s*H\b": lambda d: (d.get("home") or {}).get("ppg"),
-    r"^xG\s*B\b.*(s(a|ä)song|overall)|^xG B": lambda d: (d.get("away") or {}).get("xg_for"),
-    r"^xGA\s*B\b|xG\s*B\s*\(borta\)|xG-against B": lambda d: (d.get("away") or {}).get("xg_against"),
-    r"^PPG\s*B\b": lambda d: (d.get("away") or {}).get("ppg"),
-}
+        _set_if_not_none(ws, row, c_match, mn)
+        _set_if_not_none(ws, row, c_home,  r.get("hemmalag"))
+        _set_if_not_none(ws, row, c_away,  r.get("bortalag"))
+        _set_if_not_none(ws, row, c_o1,    r.get("odds_1"))
+        _set_if_not_none(ws, row, c_ox,    r.get("odds_x"))
+        _set_if_not_none(ws, row, c_o2,    r.get("odds_2"))
+        _set_if_not_none(ws, row, c_f1,    r.get("folk_1"))
+        _set_if_not_none(ws, row, c_fx,    r.get("folk_x"))
+        _set_if_not_none(ws, row, c_f2,    r.get("folk_2"))
+        _set_if_not_none(ws, row, c_sv1,   r.get("spelv_1"))
+        _set_if_not_none(ws, row, c_svx,   r.get("spelv_x"))
+        _set_if_not_none(ws, row, c_sv2,   r.get("spelv_2"))
 
 def write_footy_into_data_sheet(wb):
     if not FOOTY:
         return
-    ws = _find_sheet(wb, DATA_SHEET_NAME)
+    ws = _sheet(wb, DATA_SHEET_NAME)
 
-    # hitta kolumner
-    col_map = {}
-    for hdr_regex in FOOTY_TO_DATA_MAP:
-        col_map[hdr_regex] = find_col_by_header(ws, hdr_regex)
+    c_form_h = _find_col(ws, COL_FORM_H)
+    c_form_b = _find_col(ws, COL_FORM_B)
+    c_h2h    = _find_col(ws, COL_H2H_5)
+    c_xg_h   = _find_col(ws, COL_XG_H_OV)
+    c_xga_h  = _find_col(ws, COL_XGA_H_OV)
+    c_xg_b   = _find_col(ws, COL_XG_B_OV)
+    c_xga_b  = _find_col(ws, COL_XGA_B_OV)
+    c_ppg_h  = _find_col(ws, COL_PPG_H_OV)
+    c_ppg_b  = _find_col(ws, COL_PPG_B_OV)
 
-    for mn, data in FOOTY.items():
+    for mn, d in FOOTY.items():
         row = START_ROW - 1 + int(mn)
-        for hdr_regex, maker in FOOTY_TO_DATA_MAP.items():
-            c = col_map.get(hdr_regex)
-            if not c:
-                continue
-            try:
-                val = maker(data)
-            except Exception:
-                val = None
-            ws.cell(row=row, column=c, value=val)
+        home = d.get("home") or {}
+        away = d.get("away") or {}
+        h2h  = d.get("h2h_last5") or {}
 
-# ---------- Skriv hela Excel ----------
+        _set_if_not_none(ws, row, c_form_h, home.get("form_last5"))
+        _set_if_not_none(ws, row, c_form_b, away.get("form_last5"))
+
+        if any(h2h.get(k) is not None for k in ("W","D","L")):
+            s = f"W:{h2h.get('W')} D:{h2h.get('D')} L:{h2h.get('L')}"
+            _set_if_not_none(ws, row, c_h2h, s)
+
+        _set_if_not_none(ws, row, c_xg_h,  home.get("xg_for"))
+        _set_if_not_none(ws, row, c_xga_h, home.get("xg_against"))
+        _set_if_not_none(ws, row, c_xg_b,  away.get("xg_for"))
+        _set_if_not_none(ws, row, c_xga_b, away.get("xg_against"))
+        _set_if_not_none(ws, row, c_ppg_h, home.get("ppg"))
+        _set_if_not_none(ws, row, c_ppg_b, away.get("ppg"))
+
 def write_excel_bytes(template_path: str) -> bytes:
     wb = _open_wb(template_path)
-
-    # 1) kupong → Data (om rubriker hittas)
     write_kupong_into_data_sheet(wb)
-    # 2) footy → Data
     write_footy_into_data_sheet(wb)
-
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
