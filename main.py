@@ -12,9 +12,10 @@ from excel_utils import (
 )
 from scrape_footy import fetch_footy, align_with_excel_names
 
+TEMPLATE_XLSX = "Stryktipsanalys_MASTER.xlsx"  # lägg denna i repo-roten
+
 app = FastAPI()
 
-# --------- Models ----------
 class KupongIn(BaseModel):
     svenskaspel: List[Dict[str, Any]]
 
@@ -22,7 +23,6 @@ class FootyIn(BaseModel):
     matchnr: int
     url: HttpUrl
 
-# --------- Routes ----------
 @app.post("/svenskaspel")
 def post_svenskaspel(payload: KupongIn):
     update_kupong(payload.svenskaspel)
@@ -30,13 +30,12 @@ def post_svenskaspel(payload: KupongIn):
 
 @app.post("/footy")
 def post_footy(payload: FootyIn):
-    # hämta lag-namn från kupongen för samma matchnr (för namnmatchning)
     excel_home = excel_away = None
     for r in KUPONG:
         try:
             if int(r.get("matchnr")) == int(payload.matchnr):
-                excel_home = r.get("hemmalag")
-                excel_away = r.get("bortalag")
+                excel_home = r.get("hemmalag") or ""
+                excel_away = r.get("bortalag") or ""
                 break
         except Exception:
             continue
@@ -46,7 +45,6 @@ def post_footy(payload: FootyIn):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Footy-fel: {e}")
 
-    # alignera namn / byt hem-borta om det blev inverterat
     if excel_home and excel_away:
         h = data.get("home", {}).get("name") or ""
         a = data.get("away", {}).get("name") or ""
@@ -62,12 +60,10 @@ def post_footy(payload: FootyIn):
 
 @app.get("/excel")
 def get_excel():
-    template_path = "Stryktipsanalys.xlsx"  # se till att denna finns i repo root
     try:
-        blob = write_excel_bytes(template_path)
+        blob = write_excel_bytes(TEMPLATE_XLSX)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Excel-fel: {e}")
-
     ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     fname = f"Stryktipsanalys_fylld_{ts}.xlsx"
     return StreamingResponse(
@@ -83,4 +79,4 @@ def post_reset():
 
 @app.get("/")
 def root():
-    return JSONResponse({"ok": True, "service": "tipsbot", "endpoints": ["/svenskaspel", "/footy", "/excel", "/reset"]})
+    return JSONResponse({"ok": True, "endpoints": ["/svenskaspel", "/footy", "/excel", "/reset"]})
