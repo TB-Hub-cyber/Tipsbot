@@ -1,148 +1,103 @@
 # excel_utils.py
 from __future__ import annotations
-import io
-import re
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
-# ---- Global state (fylls via API:t) ----
-KUPONG: List[Dict[str, Any]] = []
-FOOTY: Dict[int, Dict[str, Any]] = {}
+EXCEL_PATH = "Stryktipsanalys_MASTER.xlsx"
+SHEET = "Data"
 
-DATA_SHEET_NAME = "Data"
-START_ROW = 2  # Match 1 ligger på rad 2
-
-def reset_state():
-    KUPONG.clear()
-    FOOTY.clear()
-
-def update_kupong(rows: List[Dict[str, Any]]):
-    global KUPONG
-    KUPONG = list(rows or [])
-
-def update_footy(matchnr: int, data: Dict[str, Any]):
-    FOOTY[int(matchnr)] = data
-
-def _open_wb(path: str):
-    return load_workbook(path)
-
-def _sheet(wb, name: str):
-    return wb[name] if name in wb.sheetnames else wb.active
-
-def _find_col(ws, exact_header: str) -> Optional[int]:
+# Hjälpare: hitta kolumnindex via headertext
+def _header_map(ws: Worksheet) -> Dict[str, int]:
+    m: Dict[str, int] = {}
     for c in range(1, ws.max_column + 1):
         v = ws.cell(row=1, column=c).value
-        if isinstance(v, str) and v.strip() == exact_header:
-            return c
+        if isinstance(v, str) and v.strip():
+            m[v.strip()] = c
+    return m
+
+def _find_row_by_matchnr(ws: Worksheet, hdr: Dict[str, int], matchnr: int) -> Optional[int]:
+    col = hdr.get("Matchnr") or hdr.get("MatchNr") or hdr.get("matchnr")
+    if not col:
+        return None
+    for r in range(2, ws.max_row + 1):
+        if ws.cell(row=r, column=col).value == matchnr:
+            return r
     return None
 
-# --------- Exakta rubriker enligt din fil ---------
-# Kupong
-COL_MATCH         = "Match"
-COL_HOME          = "Hemmalag"
-COL_AWAY          = "Bortalag"
-COL_ODDS_1        = "Odds 1"
-COL_ODDS_X        = "Odds X"
-COL_ODDS_2        = "Odds 2"
-COL_FOLK_1        = "Folkets val 1"
-COL_FOLK_X        = "Folkets val X"
-COL_FOLK_2        = "Folkets val 2"
-COL_SV_1          = "Spelvärde 1"
-COL_SV_X          = "Spelvärde X"
-COL_SV_2          = "Spelvärde 2"
+def update_kupong(rows: List[Dict[str, Any]]) -> None:
+    """Skriv in stryket-data (odds, folk, spelvärde) – kolumnerna antas redan finnas."""
+    wb = load_workbook(EXCEL_PATH)
+    ws = wb[SHEET]
+    hdr = _header_map(ws)
 
-# Footy
-COL_FORM_H        = "Form H (senaste 5)"
-COL_FORM_B        = "Form B (senaste 5)"
-COL_H2H_5         = "H2H senaste 5"
-COL_XG_H_OV       = "xG H (overall)"
-COL_XGA_H_OV      = "xGA H (overall)"
-COL_XG_B_OV       = "xG B (overall)"
-COL_XGA_B_OV      = "xGA B (overall)"
-COL_PPG_H_OV      = "PPG H (overall)"
-COL_PPG_B_OV      = "PPG B (overall)"
+    need = [
+        "Matchnr","Hemmalag","Bortalag",
+        "Odds % 1","Odds % X","Odds % 2",
+        "Folk % 1","Folk % X","Folk % 2",
+        "Värde 1","Värde X","Värde 2",
+    ]
+    miss = [h for h in need if h not in hdr]
+    if miss:
+        raise RuntimeError(f"Saknar kolumner i Excel: {miss}")
 
-def _set_if_not_none(ws, row: int, col: Optional[int], value):
-    if col and value is not None:
-        ws.cell(row=row, column=col, value=value)
-
-def write_kupong_into_data_sheet(wb):
-    if not KUPONG:
-        return
-    ws = _sheet(wb, DATA_SHEET_NAME)
-
-    c_match = _find_col(ws, COL_MATCH)
-    c_home  = _find_col(ws, COL_HOME)
-    c_away  = _find_col(ws, COL_AWAY)
-    c_o1    = _find_col(ws, COL_ODDS_1)
-    c_ox    = _find_col(ws, COL_ODDS_X)
-    c_o2    = _find_col(ws, COL_ODDS_2)
-    c_f1    = _find_col(ws, COL_FOLK_1)
-    c_fx    = _find_col(ws, COL_FOLK_X)
-    c_f2    = _find_col(ws, COL_FOLK_2)
-    c_sv1   = _find_col(ws, COL_SV_1)
-    c_svx   = _find_col(ws, COL_SV_X)
-    c_sv2   = _find_col(ws, COL_SV_2)
-
-    for r in KUPONG:
-        try:
-            mn = int(r.get("matchnr"))
-        except Exception:
+    for row in rows:
+        r = _find_row_by_matchnr(ws, hdr, row["matchnr"])
+        if not r:
             continue
-        row = START_ROW - 1 + mn
+        ws.cell(r, hdr["Hemmalag"]).value = row["hemmalag"]
+        ws.cell(r, hdr["Bortalag"]).value = row["bortalag"]
+        ws.cell(r, hdr["Odds % 1"]).value = row.get("odds_1")
+        ws.cell(r, hdr["Odds % X"]).value = row.get("odds_x")
+        ws.cell(r, hdr["Odds % 2"]).value = row.get("odds_2")
+        ws.cell(r, hdr["Folk % 1"]).value = row.get("folk_1")
+        ws.cell(r, hdr["Folk % X"]).value = row.get("folk_x")
+        ws.cell(r, hdr["Folk % 2"]).value = row.get("folk_2")
+        ws.cell(r, hdr["Värde 1"]).value = row.get("spelv_1")
+        ws.cell(r, hdr["Värde X"]).value = row.get("spelv_x")
+        ws.cell(r, hdr["Värde 2"]).value = row.get("spelv_2")
 
-        _set_if_not_none(ws, row, c_match, mn)
-        _set_if_not_none(ws, row, c_home,  r.get("hemmalag"))
-        _set_if_not_none(ws, row, c_away,  r.get("bortalag"))
-        _set_if_not_none(ws, row, c_o1,    r.get("odds_1"))
-        _set_if_not_none(ws, row, c_ox,    r.get("odds_x"))
-        _set_if_not_none(ws, row, c_o2,    r.get("odds_2"))
-        _set_if_not_none(ws, row, c_f1,    r.get("folk_1"))
-        _set_if_not_none(ws, row, c_fx,    r.get("folk_x"))
-        _set_if_not_none(ws, row, c_f2,    r.get("folk_2"))
-        _set_if_not_none(ws, row, c_sv1,   r.get("spelv_1"))
-        _set_if_not_none(ws, row, c_svx,   r.get("spelv_x"))
-        _set_if_not_none(ws, row, c_sv2,   r.get("spelv_2"))
+    wb.save(EXCEL_PATH)
 
-def write_footy_into_data_sheet(wb):
-    if not FOOTY:
-        return
-    ws = _sheet(wb, DATA_SHEET_NAME)
+def update_footy(matchnr: int, data: Dict[str, Any]) -> None:
+    """Skriv in Footy-data till fördefinierade kolumner (efter rubrikerna i din MASTER-fil)."""
+    wb = load_workbook(EXCEL_PATH)
+    ws = wb[SHEET]
+    hdr = _header_map(ws)
 
-    c_form_h = _find_col(ws, COL_FORM_H)
-    c_form_b = _find_col(ws, COL_FORM_B)
-    c_h2h    = _find_col(ws, COL_H2H_5)
-    c_xg_h   = _find_col(ws, COL_XG_H_OV)
-    c_xga_h  = _find_col(ws, COL_XGA_H_OV)
-    c_xg_b   = _find_col(ws, COL_XG_B_OV)
-    c_xga_b  = _find_col(ws, COL_XGA_B_OV)
-    c_ppg_h  = _find_col(ws, COL_PPG_H_OV)
-    c_ppg_b  = _find_col(ws, COL_PPG_B_OV)
+    r = _find_row_by_matchnr(ws, hdr, matchnr)
+    if not r:
+        raise RuntimeError(f"Hittar ingen rad med Matchnr={matchnr}")
 
-    for mn, d in FOOTY.items():
-        row = START_ROW - 1 + int(mn)
-        home = d.get("home") or {}
-        away = d.get("away") or {}
-        h2h  = d.get("h2h_last5") or {}
+    # Mappning: anpassad efter rubriknamn i din fil
+    mapping = {
+        "Form H (senaste 5)": "form_home",
+        "Form B (senaste 5)": "form_away",
+        "H2H senaste 5": "h2h_last5",
+        "xG H (overall)": "xg_home_overall",
+        "xG H (hemma)": "xg_home_home",
+        "xGA H (overall)": "xga_home_overall",
+        "xGA H (hemma)": "xga_home_home",
+        "Gjorda mål H (overall)": "gf_home_overall",
+        "Insläppta H (overall)": "ga_home_overall",
+        "xG B (overall)": "xg_away_overall",
+        "xG B (borta)": "xg_away_away",
+        "xGA B (overall)": "xga_away_overall",
+        "xGA B (borta)": "xga_away_away",
+        "Gjorda mål B (overall)": "gf_away_overall",
+        "Insläppta B (overall)": "ga_away_overall",
+        "PPG H (overall)": "ppg_home_overall",
+        "PPG H (hemma)": "ppg_home_home",
+        "PPG B (overall)": "ppg_away_overall",
+        "PPG B (borta)": "ppg_away_away",
+        "Footy-källa": "source",
+    }
 
-        _set_if_not_none(ws, row, c_form_h, home.get("form_last5"))
-        _set_if_not_none(ws, row, c_form_b, away.get("form_last5"))
+    for col_header, key in mapping.items():
+        c = hdr.get(col_header)
+        if not c:
+            # hoppa tyst om kolumn inte finns (så vi kan lägga till i filen utan krasch)
+            continue
+        ws.cell(row=r, column=c).value = data.get(key)
 
-        if any(h2h.get(k) is not None for k in ("W","D","L")):
-            s = f"W:{h2h.get('W')} D:{h2h.get('D')} L:{h2h.get('L')}"
-            _set_if_not_none(ws, row, c_h2h, s)
-
-        _set_if_not_none(ws, row, c_xg_h,  home.get("xg_for"))
-        _set_if_not_none(ws, row, c_xga_h, home.get("xg_against"))
-        _set_if_not_none(ws, row, c_xg_b,  away.get("xg_for"))
-        _set_if_not_none(ws, row, c_xga_b, away.get("xg_against"))
-        _set_if_not_none(ws, row, c_ppg_h, home.get("ppg"))
-        _set_if_not_none(ws, row, c_ppg_b, away.get("ppg"))
-
-def write_excel_bytes(template_path: str) -> bytes:
-    wb = _open_wb(template_path)
-    write_kupong_into_data_sheet(wb)
-    write_footy_into_data_sheet(wb)
-    bio = io.BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
+    wb.save(EXCEL_PATH)
