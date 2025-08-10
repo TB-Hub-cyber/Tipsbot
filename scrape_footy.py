@@ -11,7 +11,7 @@ HEADERS = {
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 }
 
-# ---------- Namn-normalisering & alias ----------
+# -------- Namn-normalisering & alias --------
 ALIAS = {
     "wolves": "wolverhampton wanderers",
     "wolverhampton": "wolverhampton wanderers",
@@ -29,7 +29,6 @@ ALIAS = {
     "northamp.": "northampton town",
     "stockp. c": "stockport county",
     "preston": "preston north end",
-    # fyll på vid behov
 }
 REMOVE_TOKENS = r"\b(fc|afc|cf|city|united|town|athletic|the|club)\b"
 
@@ -46,12 +45,10 @@ def similar(a: str, b: str) -> float:
     return SequenceMatcher(None, norm_name(a), norm_name(b)).ratio()
 
 def align_with_excel_names(home: str, away: str, excel_home: str, excel_away: str):
-    """Returnera ev. swappade namn beroende på vad som liknar Excel mest."""
     score_same = (similar(home, excel_home) + similar(away, excel_away)) / 2
     score_swap = (similar(home, excel_away) + similar(away, excel_home)) / 2
     return (home, away, False) if score_same >= score_swap else (away, home, True)
 
-# ---------- Hjälpare ----------
 def _float_or_none(s: Optional[str]) -> Optional[float]:
     if not s: return None
     s2 = re.sub(r"[^\d\.\-]", "", s)
@@ -60,19 +57,18 @@ def _float_or_none(s: Optional[str]) -> Optional[float]:
 def _text(el) -> str:
     return (el.get_text(" ", strip=True) if el else "").strip()
 
-# ---------- Scrape ----------
 def fetch_footy(url: str, matchnr: int) -> Dict[str, Any]:
     """
-    Hämtar nyckelstatistik från en FootyStats H2H-sida:
-    - Lag (home/away), xG For, xGA, PPG, form (5), H2H W/D/L
+    Hämta grunddata från en FootyStats H2H-sida:
+    - Lag (home/away), xG For, xGA, PPG (overall), form (senaste 5),
+      samt enkel H2H summering W/D/L om den finns.
     """
     r = requests.get(url, headers=HEADERS, timeout=25)
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
 
-    # Försök hitta huvudtitel "Home vs Away"
     title = _text(soup.find(["h1", "h2", "h3"])) or _text(soup.find("title"))
-    home, away = None, None
+    home = away = None
     m = re.search(r"(.+?)\s+vs\s+(.+?)\b", title, re.I)
     if m:
         home, away = m.group(1).strip(), m.group(2).strip()
@@ -82,7 +78,6 @@ def fetch_footy(url: str, matchnr: int) -> Dict[str, Any]:
         if not team_name:
             return stats
 
-        # hitta större sektion som nämner laget
         block = None
         for tag in soup.find_all(True, string=re.compile(re.escape(team_name), re.I)):
             cand = tag
@@ -92,43 +87,37 @@ def fetch_footy(url: str, matchnr: int) -> Dict[str, Any]:
                 block = cand
                 break
 
-        def val_in_block(regex):
+        def find_value(regex):
             if not block:
                 return None
             t = _text(block)
             m1 = re.search(regex + r".{0,20}?([-+]?\d+(?:\.\d+)?)", t, re.I)
             return _float_or_none(m1.group(1)) if m1 else None
 
-        stats["xg_for"] = val_in_block(r"(?:xG(?:\s*For)?|Expected Goals)")
-        stats["xg_against"] = val_in_block(r"(?:xGA|xG Against)")
-        stats["ppg"] = val_in_block(r"(?:PPG|Points per game)")
+        stats["xg_for"] = find_value(r"(?:\bxG(?:\s*For)?\b|Expected Goals)")
+        stats["xg_against"] = find_value(r"(?:\bxGA\b|xG Against)")
+        stats["ppg"] = find_value(r"(?:\bPPG\b|Points per game)")
 
         form_txt = None
         if block:
             t = _text(block)
-            mform = re.search(r"(?:\b[WDL]\b){3,}", t.replace(" ", ""))
-            if not mform:
-                mform = re.search(r"([WDL]{3,})", t)
+            mform = re.search(r"([WDL]{3,})", t.replace(" ", ""))
             if mform:
-                form_txt = mform.group(0).replace(" ", "")[:5]
+                form_txt = mform.group(1)[:5]
         stats["form_last5"] = form_txt
         return stats
 
     home_stats = scrape_team_block(home)
     away_stats = scrape_team_block(away)
 
-    # H2H grovt
     h2h_w = h2h_d = h2h_l = None
-    h2h_block = soup.find(string=re.compile(r"(Head\s*to\s*Head|H2H)", re.I))
-    if h2h_block:
-        box = h2h_block.find_parent()
+    h2h_label = soup.find(string=re.compile(r"(Head\s*to\s*Head|H2H)", re.I))
+    if h2h_label:
+        box = h2h_label.find_parent()
         if box:
-            seq = "".join(re.findall(r"[WDL]", _text(box)))
-            seq = seq[:10]
+            seq = "".join(re.findall(r"[WDL]", _text(box)))[:10]
             if seq:
-                h2h_w = seq.count("W")
-                h2h_d = seq.count("D")
-                h2h_l = seq.count("L")
+                h2h_w, h2h_d, h2h_l = seq.count("W"), seq.count("D"), seq.count("L")
 
     return {
         "matchnr": matchnr,
