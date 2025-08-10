@@ -1,22 +1,23 @@
 # main.py
 from __future__ import annotations
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, HttpUrl
-from typing import List, Dict, Any
-import io
-import datetime as dt
+from typing import List, Dict, Any, Optional
+import io, datetime as dt
 
 from excel_utils import (
     update_kupong, update_footy, write_excel_bytes, reset_state, KUPONG
 )
 from scrape_footy import fetch_footy, align_with_excel_names
+from scrape_stryket import scrape_stryketanalysen
+# (om du också har spela.svenskaspel-se-scraper:)
+# from scrape_svspel import fetch_kupong as scrape_svenskaspel
 
-TEMPLATE_XLSX = "Stryktipsanalys_MASTER.xlsx"  # lägg denna i repo-roten
-
+TEMPLATE_XLSX = "Stryktipsanalys_MASTER.xlsx"
 app = FastAPI()
 
-class KupongIn(BaseModel):
+class KupongList(BaseModel):
     svenskaspel: List[Dict[str, Any]]
 
 class FootyIn(BaseModel):
@@ -24,9 +25,36 @@ class FootyIn(BaseModel):
     url: HttpUrl
 
 @app.post("/svenskaspel")
-def post_svenskaspel(payload: KupongIn):
-    update_kupong(payload.svenskaspel)
-    return {"ok": True, "n": len(payload.svenskaspel)}
+def post_svenskaspel(
+    maybe_list: Optional[KupongList] = Body(default=None),
+    url: Optional[str] = Body(default=None),
+    debug: Optional[bool] = Body(default=False)
+):
+    """
+    Accepterar:
+    1) { "svenskaspel":[{...}, ...] }  – direktdata från klienten
+    2) { "url":"https://www.stryketanalysen.se/stryktipset/" } – så skrapar vi själva
+       (auto-detekterar domän och väljer rätt scraper)
+    """
+    if maybe_list and maybe_list.svenskaspel:
+        update_kupong(maybe_list.svenskaspel)
+        return {"ok": True, "n": len(maybe_list.svenskaspel), "mode": "direct"}
+
+    if url:
+        try:
+            if "stryketanalysen.se" in url:
+                rows = scrape_stryketanalysen(url)
+            # elif "svenskaspel.se" in url:
+            #     rows = scrape_svenskaspel(url)   # om/ när du vill återaktivera
+            else:
+                raise ValueError("Okänd källa i url – använd stryketanalysen.se.")
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Scrape-fel: {e}")
+
+        update_kupong(rows)
+        return {"ok": True, "n": len(rows), "mode": "scraped"}
+
+    raise HTTPException(status_code=422, detail="Skicka {svenskaspel:[...]} ELLER {url:'...'}.")
 
 @app.post("/footy")
 def post_footy(payload: FootyIn):
@@ -34,8 +62,8 @@ def post_footy(payload: FootyIn):
     for r in KUPONG:
         try:
             if int(r.get("matchnr")) == int(payload.matchnr):
-                excel_home = r.get("hemmalag") or ""
-                excel_away = r.get("bortalag") or ""
+                excel_home = (r.get("hemmalag") or "").strip()
+                excel_away = (r.get("bortalag") or "").strip()
                 break
         except Exception:
             continue
