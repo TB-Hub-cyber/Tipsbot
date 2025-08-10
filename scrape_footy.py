@@ -1,101 +1,152 @@
+# scrape_footy.py
+from __future__ import annotations
 import re
+from typing import Dict, Any, Optional
+import requests
 from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright
+from difflib import SequenceMatcher
 
-def _to_float(x): 
-    try: return float(x.replace(',', '.'))
-    except: return None
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+}
 
-async def fetch_footy(url: str, debug: bool=False):
-    debug_snap = None
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        await page.goto(url, wait_until="networkidle", timeout=90000)
-        await page.wait_for_timeout(1200)
-        html = await page.content()
-        if debug:
-            debug_snap = html
-        await browser.close()
+# ---------- Namn-normalisering & alias ----------
+ALIAS = {
+    "wolves": "wolverhampton wanderers",
+    "wolverhampton": "wolverhampton wanderers",
+    "west brom": "west bromwich albion",
+    "qpr": "queens park rangers",
+    "sheff u": "sheffield united",
+    "sheff.u": "sheffield united",
+    "sheffield u": "sheffield united",
+    "man utd": "manchester united",
+    "man city": "manchester city",
+    "spurs": "tottenham hotspur",
+    "forest": "nottingham forest",
+    "middlesb.": "middlesbrough",
+    "portsmo.": "portsmouth",
+    "northamp.": "northampton town",
+    "stockp. c": "stockport county",
+    "preston": "preston north end",
+    # fyll på vid behov
+}
+REMOVE_TOKENS = r"\b(fc|afc|cf|city|united|town|athletic|the|club)\b"
 
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text(" ", strip=True)
+def norm_name(s: str) -> str:
+    if not s: return ""
+    s = s.lower()
+    s = s.replace("&", "and").replace("-", " ").replace(".", " ")
+    s = re.sub(r"[^a-z0-9\s]", "", s)
+    s = re.sub(REMOVE_TOKENS, "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return ALIAS.get(s, s)
 
-    # home-away from title
-    home = away = None
-    title = soup.find(['h1','h2'])
-    if title and '-' in title.get_text():
-        parts = [t.strip() for t in title.get_text().split('-')]
-        if len(parts) >= 2:
-            home, away = parts[0], parts[1]
+def similar(a: str, b: str) -> float:
+    return SequenceMatcher(None, norm_name(a), norm_name(b)).ratio()
 
-    # Grab triplets for xG/xGA/AVG/Scored/Conceded
-    def grab_triples(label):
-        all_tr = re.findall(rf"{label}\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)\s+(\d+(?:[.,]\d+)?)", text, flags=re.I)
-        if len(all_tr) >= 2:
-            def conv(t): return tuple(_to_float(x) for x in t)
-            return conv(all_tr[0]), conv(all_tr[1])  # H then B
-        return None
+def align_with_excel_names(home: str, away: str, excel_home: str, excel_away: str):
+    """Returnera ev. swappade namn beroende på vad som liknar Excel mest."""
+    score_same = (similar(home, excel_home) + similar(away, excel_away)) / 2
+    score_swap = (similar(home, excel_away) + similar(away, excel_home)) / 2
+    return (home, away, False) if score_same >= score_swap else (away, home, True)
 
-    triples = {}
-    for lb in ("xG","xGA","AVG","Scored","Conceded"):
-        triples[lb] = grab_triples(lb)
+# ---------- Hjälpare ----------
+def _float_or_none(s: Optional[str]) -> Optional[float]:
+    if not s: return None
+    s2 = re.sub(r"[^\d\.\-]", "", s)
+    return float(s2) if re.search(r"\d", s2) else None
 
-    # PPG heuristics
-    def last_number_after(anchor, occur=0):
-        ms = list(re.finditer(rf"{anchor}.*?(\d+(?:[.,]\d+)?)", text, flags=re.I))
-        if len(ms) > occur:
-            return _to_float(ms[occur].group(1))
-        return None
+def _text(el) -> str:
+    return (el.get_text(" ", strip=True) if el else "").strip()
 
-    ppg_H_overall = last_number_after("Overall", 0)
-    ppg_H_home    = last_number_after("Home", 0)
-    ppg_B_overall = last_number_after("Overall", 1)
-    ppg_B_away    = last_number_after("Away", 1)
+# ---------- Scrape ----------
+def fetch_footy(url: str, matchnr: int) -> Dict[str, Any]:
+    """
+    Hämtar nyckelstatistik från en FootyStats H2H-sida:
+    - Lag (home/away), xG For, xGA, PPG, form (5), H2H W/D/L
+    """
+    r = requests.get(url, headers=HEADERS, timeout=25)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
 
-    # Form (heuristic)
-    form_H = None
-    m = re.search(r"Form.*?([WLDrawX\-– ]{5,})", text, flags=re.I)
-    if m: form_H = m.group(1).strip()
-    form_B = None
+    # Försök hitta huvudtitel "Home vs Away"
+    title = _text(soup.find(["h1", "h2", "h3"])) or _text(soup.find("title"))
+    home, away = None, None
+    m = re.search(r"(.+?)\s+vs\s+(.+?)\b", title, re.I)
+    if m:
+        home, away = m.group(1).strip(), m.group(2).strip()
 
-    # H2H
-    h2h_txt = None
-    m = re.search(r"Head to Head.*?(\d+)\s*-\s*(\d+)\s*-\s*(\d+)", text, flags=re.I)
-    if m: h2h_txt = f"{m.group(1)}–{m.group(2)}–{m.group(3)}"
+    def scrape_team_block(team_name: Optional[str]):
+        stats = {"team": team_name or ""}
+        if not team_name:
+            return stats
 
-    data = {
-        "home": home, "away": away,
-        "xG": {"H":{"overall":None,"home":None,"away":None}, "B":{"overall":None,"home":None,"away":None}},
-        "xGA":{"H":{"overall":None,"home":None,"away":None}, "B":{"overall":None,"home":None,"away":None}},
-        "scored":{"H":{"overall":None,"home":None,"away":None}, "B":{"overall":None,"home":None,"away":None}},
-        "conceded":{"H":{"overall":None,"home":None,"away":None}, "B":{"overall":None,"home":None,"away":None}},
-        "ppg":{"H":{"overall":ppg_H_overall,"home":ppg_H_home,"away":None},
-               "B":{"overall":ppg_B_overall,"home":None,"away":ppg_B_away}},
-        "form":{"H":{"last5":form_H,"home5":None,"away5":None},
-                "B":{"last5":form_B,"home5":None,"away5":None}},
-        "h2h":{"txt":h2h_txt},
-        "debug": debug_snap if debug else None
+        # hitta större sektion som nämner laget
+        block = None
+        for tag in soup.find_all(True, string=re.compile(re.escape(team_name), re.I)):
+            cand = tag
+            for _ in range(3):
+                cand = cand.parent or cand
+            if cand and len(_text(cand)) > 50:
+                block = cand
+                break
+
+        def val_in_block(regex):
+            if not block:
+                return None
+            t = _text(block)
+            m1 = re.search(regex + r".{0,20}?([-+]?\d+(?:\.\d+)?)", t, re.I)
+            return _float_or_none(m1.group(1)) if m1 else None
+
+        stats["xg_for"] = val_in_block(r"(?:xG(?:\s*For)?|Expected Goals)")
+        stats["xg_against"] = val_in_block(r"(?:xGA|xG Against)")
+        stats["ppg"] = val_in_block(r"(?:PPG|Points per game)")
+
+        form_txt = None
+        if block:
+            t = _text(block)
+            mform = re.search(r"(?:\b[WDL]\b){3,}", t.replace(" ", ""))
+            if not mform:
+                mform = re.search(r"([WDL]{3,})", t)
+            if mform:
+                form_txt = mform.group(0).replace(" ", "")[:5]
+        stats["form_last5"] = form_txt
+        return stats
+
+    home_stats = scrape_team_block(home)
+    away_stats = scrape_team_block(away)
+
+    # H2H grovt
+    h2h_w = h2h_d = h2h_l = None
+    h2h_block = soup.find(string=re.compile(r"(Head\s*to\s*Head|H2H)", re.I))
+    if h2h_block:
+        box = h2h_block.find_parent()
+        if box:
+            seq = "".join(re.findall(r"[WDL]", _text(box)))
+            seq = seq[:10]
+            if seq:
+                h2h_w = seq.count("W")
+                h2h_d = seq.count("D")
+                h2h_l = seq.count("L")
+
+    return {
+        "matchnr": matchnr,
+        "url": url,
+        "home": {
+            "name": home_stats.get("team"),
+            "xg_for": home_stats.get("xg_for"),
+            "xg_against": home_stats.get("xg_against"),
+            "ppg": home_stats.get("ppg"),
+            "form_last5": home_stats.get("form_last5"),
+        },
+        "away": {
+            "name": away_stats.get("team"),
+            "xg_for": away_stats.get("xg_for"),
+            "xg_against": away_stats.get("xg_against"),
+            "ppg": away_stats.get("ppg"),
+            "form_last5": away_stats.get("form_last5"),
+        },
+        "h2h_last5": {"W": h2h_w, "D": h2h_d, "L": h2h_l},
+        "page_title": title,
     }
-
-    if triples.get("xG"):
-        h,b = triples["xG"]
-        data["xG"]["H"]["overall"],data["xG"]["H"]["home"],data["xG"]["H"]["away"] = h
-        data["xG"]["B"]["overall"],data["xG"]["B"]["home"],data["xG"]["B"]["away"] = b
-    if triples.get("xGA"):
-        h,b = triples["xGA"]
-        data["xGA"]["H"]["overall"],data["xGA"]["H"]["home"],data["xGA"]["H"]["away"] = h
-        data["xGA"]["B"]["overall"],data["xGA"]["B"]["home"],data["xGA"]["B"]["away"] = b
-    if triples.get("Scored"):
-        h,b = triples["Scored"]
-        data["scored"]["H"]["overall"],data["scored"]["H"]["home"],data["scored"]["H"]["away"] = h
-        data["scored"]["B"]["overall"],data["scored"]["B"]["home"],data["scored"]["B"]["away"] = b
-    if triples.get("Conceded"):
-        h,b = triples["Conceded"]
-        data["conceded"]["H"]["overall"],data["conceded"]["H"]["home"],data["conceded"]["H"]["away"] = h
-        data["conceded"]["B"]["overall"],data["conceded"]["B"]["home"],data["conceded"]["B"]["away"] = b
-    if triples.get("AVG"):
-        h,b = triples["AVG"]
-        data["avg_goals"] = {"H": h[0], "B": b[0]}
-
-    return data
