@@ -1,176 +1,86 @@
-# -*- coding: utf-8 -*-
-# main.py – API för Stryktipsflödet (SVS + Stryketanalysen)
-
+# main.py
+from __future__ import annotations
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
-from fastapi.middleware.cors import CORSMiddleware
-import os, asyncio, traceback
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel, HttpUrl
+from typing import List, Dict, Any
+import io
+import datetime as dt
 
-# -------- Projektmoduler --------
-# models.py:
-#   class SvsReq(BaseModel): url: object; debug: bool = False
-#   class FootyReq(BaseModel): matchnr: int; url: object; debug: bool = False
-from models import SvsReq, FootyReq
-
-# Scrapers
-from scrape_svspel import fetch_kupong as fetch_svs       # async
-from scrape_stryket import fetch_stryket                  # async
-
-# Excel-hjälpare
 from excel_utils import (
-    update_kupong, update_footy, write_excel_bytes,
-    reset_state as excel_reset_state
+    update_kupong, update_footy, write_excel_bytes, reset_state, KUPONG
 )
-import excel_utils  # för /debug/state
+from scrape_footy import fetch_footy, align_with_excel_names
 
-# -------- Konfig --------
-TEMPLATE = "Stryktipsanalys_MASTER.xlsx"
-PW_CACHE = "/opt/render/.cache/ms-playwright"
-os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", PW_CACHE)
+app = FastAPI()
 
-app = FastAPI(title="Stryktips API", version="1.3")
+# --------- Models ----------
+class KupongIn(BaseModel):
+    svenskaspel: List[Dict[str, Any]]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
+class FootyIn(BaseModel):
+    matchnr: int
+    url: HttpUrl
 
-# -------- Playwright: installera Chromium vid uppstart --------
-async def _chromium_present() -> bool:
-    if not os.path.isdir(PW_CACHE):
-        return False
-    for _, _, files in os.walk(PW_CACHE):
-        if "chrome" in files:
-            return True
-    return False
+# --------- Routes ----------
+@app.post("/svenskaspel")
+def post_svenskaspel(payload: KupongIn):
+    update_kupong(payload.svenskaspel)
+    return {"ok": True, "n": len(payload.svenskaspel)}
 
-async def _install_chromium():
-    proc = await asyncio.create_subprocess_exec(
-        "python", "-m", "playwright", "install", "chromium",
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+@app.post("/footy")
+def post_footy(payload: FootyIn):
+    # hämta lag-namn från kupongen för samma matchnr (för namnmatchning)
+    excel_home = excel_away = None
+    for r in KUPONG:
+        try:
+            if int(r.get("matchnr")) == int(payload.matchnr):
+                excel_home = r.get("hemmalag")
+                excel_away = r.get("bortalag")
+                break
+        except Exception:
+            continue
+
+    try:
+        data = fetch_footy(str(payload.url), payload.matchnr)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Footy-fel: {e}")
+
+    # alignera namn / byt hem-borta om det blev inverterat
+    if excel_home and excel_away:
+        h = data.get("home", {}).get("name") or ""
+        a = data.get("away", {}).get("name") or ""
+        nh, na, swapped = align_with_excel_names(h, a, excel_home, excel_away)
+        if swapped:
+            data["home"], data["away"] = data["away"], data["home"]
+            data["home"]["name"], data["away"]["name"] = nh, na
+
+    update_footy(payload.matchnr, data)
+    return {"ok": True, "matchnr": payload.matchnr,
+            "home": data.get("home", {}).get("name"),
+            "away": data.get("away", {}).get("name")}
+
+@app.get("/excel")
+def get_excel():
+    template_path = "Stryktipsanalys.xlsx"  # se till att denna finns i repo root
+    try:
+        blob = write_excel_bytes(template_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Excel-fel: {e}")
+
+    ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"Stryktipsanalys_fylld_{ts}.xlsx"
+    return StreamingResponse(
+        io.BytesIO(blob),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'}
     )
-    out, err = await proc.communicate()
-    print("[startup] playwright install chromium ->", proc.returncode)
-    if proc.returncode != 0:
-        print(out.decode(errors="ignore"))
-        print(err.decode(errors="ignore"))
-
-@app.on_event("startup")
-async def startup():
-    if not await _chromium_present():
-        await _install_chromium()
-
-# -------- Utility --------
-@app.get("/health")
-def health():
-    return {"ok": True}
 
 @app.post("/reset")
-def reset():
-    excel_reset_state()
+def post_reset():
+    reset_state()
     return {"ok": True}
-
-# -------- Kupong (auto-källa) --------
-@app.post("/svenskaspel")
-async def svenskaspel(req: SvsReq):
-    """
-    Hämtar kupong från:
-      - 'svenskaspel.se' (Playwright, async)
-      - 'stryketanalysen.se' (Playwright, async)
-    Skriver in i arbetsboken via update_kupong.
-    """
-    try:
-        url = str(req.url).strip()
-        if not url:
-            return {"ok": False, "error": "Ingen URL angiven."}
-
-        if "svenskaspel.se" in url:
-            out = await fetch_svs(url, debug=req.debug)
-            källa = "Svenska Spel"
-        elif "stryketanalysen.se" in url:
-            out = await fetch_stryket(url, debug=req.debug)  # <-- async version
-            källa = "Stryketanalysen"
-        else:
-            return {"ok": False, "error": "Okänd kupongkälla. Ange SVS- eller Stryketanalysen-URL."}
-
-        if "error" in out:
-            return {"ok": False, "källa": källa, "error": out["error"]}
-
-        results = out.get("results", [])
-        if not results:
-            return {"ok": False, "källa": källa, "error": "Inga matcher hittades."}
-
-        update_kupong(results)  # ska skriva matchnr, lag, odds, folk (+ ev. spelvärde)
-        return {"ok": True, "källa": källa, "count": len(results)}
-
-    except Exception as e:
-        traceback.print_exc()
-        return {"ok": False, "error": str(e)}
-
-# -------- FootyStats (om du använder det flödet) --------
-@app.post("/footy")
-async def footy(req: FootyReq):
-    try:
-        from scrape_footy import fetch_footy  # lazy import, async
-        data = await fetch_footy(str(req.url).strip(), debug=req.debug)
-        if not isinstance(data, dict) or not data:
-            return {"ok": False, "matchnr": req.matchnr, "error": "Ingen data från Footy."}
-        update_footy(req.matchnr, data)
-        resp = {"ok": True, "matchnr": req.matchnr}
-        if req.debug and data.get("debug") is not None:
-            resp["debug_html_len"] = len(data["debug"])
-        return resp
-    except Exception as e:
-        traceback.print_exc()
-        return {"ok": False, "matchnr": req.matchnr, "error": str(e)}
-
-# -------- Excel-download --------
-@app.get("/excel/download")
-def excel_download():
-    try:
-        data = write_excel_bytes(TEMPLATE)
-    except FileNotFoundError:
-        raise HTTPException(500, "Template not found")
-    return StreamingResponse(
-        iter([data]),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=Stryktipsanalys_fylld.xlsx"},
-    )
-
-# -------- Debug --------
-@app.get("/debug/state")
-def debug_state():
-    return {"svenskaspel": excel_utils.KUPONG, "footy": excel_utils.FOOTY}
-
-@app.get("/debug/svs-html")
-def debug_svs_html():
-    p = "/tmp/svs_debug.html"
-    if not os.path.exists(p):
-        raise HTTPException(404, "Ingen svs_debug.html ännu – kör /svenskaspel med debug=True.")
-    return FileResponse(p, media_type="text/html", filename="svs_debug.html")
-
-@app.get("/debug/svs-shot")
-def debug_svs_shot():
-    p = "/tmp/svs_debug.png"
-    if not os.path.exists(p):
-        raise HTTPException(404, "Ingen svs_debug.png ännu – kör /svenskaspel med debug=True.")
-    return FileResponse(p, media_type="image/png", filename="svs_debug.png")
-
-@app.get("/debug/stryket-html")
-def debug_stryket_html():
-    p = "/tmp/stryket_debug.html"
-    if not os.path.exists(p):
-        raise HTTPException(404, "Ingen stryket_debug.html ännu – kör /svenskaspel med debug=True på Stryket-URL.")
-    return FileResponse(p, media_type="text/html", filename="stryket_debug.html")
-
-@app.get("/debug/stryket-shot")
-def debug_stryket_shot():
-    p = "/tmp/stryket_debug.png"
-    if not os.path.exists(p):
-        raise HTTPException(404, "Ingen stryket_debug.png ännu – kör /svenskaspel med debug=True på Stryket-URL.")
-    return FileResponse(p, media_type="image/png", filename="stryket_debug.png")
 
 @app.get("/")
 def root():
-    return {"service": "tipsbot", "status": "ok"}
+    return JSONResponse({"ok": True, "service": "tipsbot", "endpoints": ["/svenskaspel", "/footy", "/excel", "/reset"]})
