@@ -1,125 +1,149 @@
-# excel_utils.py – No-op layout (respekterar din mall)
+# excel_utils.py
 from __future__ import annotations
+import io
+import re
+import datetime as dt
+from typing import List, Dict, Any, Optional
 from openpyxl import load_workbook
-from io import BytesIO
-from typing import Dict, Any, List
 
-# ---------- Debug-state som /debug/state visar ----------
+# Global state (fylls av API:et)
 KUPONG: List[Dict[str, Any]] = []
 FOOTY: Dict[int, Dict[str, Any]] = {}
 
+DATA_SHEET_NAME = "Data"
+START_ROW = 2  # rad där match 1 står
+
+# ---------- Helpers ----------
 def reset_state():
-    global KUPONG, FOOTY
-    KUPONG = []
-    FOOTY = {}
+    KUPONG.clear()
+    FOOTY.clear()
 
-# ---------- Kolumnlayout (1-baserad) ----------
-# A=1, B=2, ...
-# Din mall har Spelvärde i J:K:L – vi skriver bara dit.
-COLS = {
-    "matchnr": 1,       # A
-    "hemmalag": 2,      # B
-    "bortalag": 3,      # C
-    "odds_1": 4,        # D
-    "odds_x": 5,        # E
-    "odds_2": 6,        # F
-    "folk_1": 7,        # G
-    "folk_x": 8,        # H
-    "folk_2": 9,        # I
-    "spelv_1": 10,      # J
-    "spelv_x": 11,      # K
-    "spelv_2": 12,      # L
-}
-START_ROW = 2          # första dataraden (2..14 för 13 matcher)
-SHEET_NAME = None      # None = aktiv flik; eller sätt till t.ex. "Stryktips"
-
-def _pick(d: dict, *names, default=None):
-    for n in names:
-        if n in d and d[n] is not None:
-            return d[n]
-    return default
-
-def _put(ws, row: int, key: str, value):
-    col = COLS.get(key)
-    if col is not None:
-        ws.cell(row=row, column=col, value=value)
-
-def _ensure_layout(ws):
-    """
-    Respektera mallen. Gör inget med kolumner.
-    Sätt bara rubriker i J/K/L om de helt saknas.
-    """
-    header_j = (ws.cell(row=1, column=COLS["spelv_1"]).value or "").strip()
-    header_k = (ws.cell(row=1, column=COLS["spelv_x"]).value or "").strip()
-    header_l = (ws.cell(row=1, column=COLS["spelv_2"]).value or "").strip()
-
-    if not header_j and not header_k and not header_l:
-        ws.cell(row=1, column=COLS["spelv_1"], value="Spelvärde 1")
-        ws.cell(row=1, column=COLS["spelv_x"], value="Spelvärde X")
-        ws.cell(row=1, column=COLS["spelv_2"], value="Spelvärde 2")
-    # i övrigt: rör inget
-
-# ---------- API som main.py anropar ----------
 def update_kupong(rows: List[Dict[str, Any]]):
-    """
-    Lagra kupongrader (13 st). Skrivs till Excel vid write_excel_bytes().
-    """
+    """Spara kupongrader."""
     global KUPONG
-    KUPONG = []
-    for i, r in enumerate(rows[:13], start=1):
-        KUPONG.append({
-            "matchnr": _pick(r, "matchnr", default=i),
-            "hemmalag": _pick(r, "hemmalag", "home"),
-            "bortalag": _pick(r, "bortalag", "away"),
-            "odds_1": _pick(r, "odds_1", "odds1"),
-            "odds_x": _pick(r, "odds_x", "oddsx"),
-            "odds_2": _pick(r, "odds_2", "odds2"),
-            "folk_1": _pick(r, "folk_1", "folk1"),
-            "folk_x": _pick(r, "folk_x", "folkx"),
-            "folk_2": _pick(r, "folk_2", "folk2"),
-            "spelv_1": _pick(r, "spelv_1"),
-            "spelv_x": _pick(r, "spelv_x"),
-            "spelv_2": _pick(r, "spelv_2"),
-        })
+    KUPONG = list(rows or [])
 
 def update_footy(matchnr: int, data: Dict[str, Any]):
-    """Valfri: spara FootyStats-data per matchnr (för ev. separat flik)."""
-    FOOTY[matchnr] = data or {}
+    """Spara footydata per match."""
+    FOOTY[int(matchnr)] = data
 
+def _open_wb(path: str):
+    return load_workbook(path)
+
+def _find_sheet(wb, name: str):
+    if name in wb.sheetnames:
+        return wb[name]
+    # fallback: aktivt blad
+    return wb.active
+
+def find_col_by_header(ws, patterns):
+    """
+    patterns: str eller lista av regex som matchar headertext i rad 1.
+    Returnerar kolumnindex (1-baserat) eller None.
+    """
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    headers = {}
+    for c in range(1, ws.max_column + 1):
+        txt = ws.cell(row=1, column=c).value
+        if isinstance(txt, str):
+            headers[c] = txt.strip()
+    for rx in patterns:
+        cre = re.compile(rx, re.I)
+        for c, txt in headers.items():
+            if cre.search(txt):
+                return c
+    return None
+
+# ---------- Skriv KUPONG till Data (om kolumner hittas) ----------
+KUPONG_MAP = {
+    # rubrik_regex : lambda row -> value
+    r"^Matchnr": lambda r: r.get("matchnr"),
+    r"^Hemmalag": lambda r: r.get("hemmalag"),
+    r"^Bortalag": lambda r: r.get("bortalag"),
+    r"^Odds\s*%?\s*1|^Odds\s*1\b": lambda r: r.get("odds_1"),
+    r"^Odds\s*%?\s*X|^Odds\s*X\b": lambda r: r.get("odds_x"),
+    r"^Odds\s*%?\s*2|^Odds\s*2\b": lambda r: r.get("odds_2"),
+    r"(Svenska\s*folket|Folk).*\b1\b": lambda r: r.get("folk_1"),
+    r"(Svenska\s*folket|Folk).*\bX\b": lambda r: r.get("folk_x"),
+    r"(Svenska\s*folket|Folk).*\b2\b": lambda r: r.get("folk_2"),
+    r"^V(a|ä)rde\s*1": lambda r: r.get("spelv_1"),
+    r"^V(a|ä)rde\s*X": lambda r: r.get("spelv_x"),
+    r"^V(a|ä)rde\s*2": lambda r: r.get("spelv_2"),
+}
+
+def write_kupong_into_data_sheet(wb):
+    if not KUPONG:
+        return
+    ws = _find_sheet(wb, DATA_SHEET_NAME)
+
+    # bygg kolumnkarta en gång
+    col_map = {}
+    for hdr_regex in KUPONG_MAP:
+        col_map[hdr_regex] = find_col_by_header(ws, hdr_regex)
+
+    for r in KUPONG:
+        try:
+            mn = int(r.get("matchnr"))
+        except Exception:
+            continue
+        row = START_ROW - 1 + mn
+        for hdr_regex, maker in KUPONG_MAP.items():
+            c = col_map.get(hdr_regex)
+            if not c:
+                continue
+            try:
+                val = maker(r)
+            except Exception:
+                val = None
+            ws.cell(row=row, column=c, value=val)
+
+# ---------- Skriv FOOTY till Data ----------
+FOOTY_TO_DATA_MAP = {
+    r"^Form\s*H\b|Hemmaform": lambda d: (d.get("home") or {}).get("form_last5"),
+    r"^Form\s*B\b|Bortaform": lambda d: (d.get("away") or {}).get("form_last5"),
+    r"H2H.*(senaste|last)\s*5": lambda d: (
+        "W:{W} D:{D} L:{L}".format(**{k: (d.get("h2h_last5") or {}).get(k) for k in ["W","D","L"]})
+    ),
+    r"^xG\s*H\b.*(s(a|ä)song|overall)|^xG H": lambda d: (d.get("home") or {}).get("xg_for"),
+    r"^xGA\s*H\b|xG\s*H\s*\(hemma\)|xG-against H": lambda d: (d.get("home") or {}).get("xg_against"),
+    r"^PPG\s*H\b": lambda d: (d.get("home") or {}).get("ppg"),
+    r"^xG\s*B\b.*(s(a|ä)song|overall)|^xG B": lambda d: (d.get("away") or {}).get("xg_for"),
+    r"^xGA\s*B\b|xG\s*B\s*\(borta\)|xG-against B": lambda d: (d.get("away") or {}).get("xg_against"),
+    r"^PPG\s*B\b": lambda d: (d.get("away") or {}).get("ppg"),
+}
+
+def write_footy_into_data_sheet(wb):
+    if not FOOTY:
+        return
+    ws = _find_sheet(wb, DATA_SHEET_NAME)
+
+    # hitta kolumner
+    col_map = {}
+    for hdr_regex in FOOTY_TO_DATA_MAP:
+        col_map[hdr_regex] = find_col_by_header(ws, hdr_regex)
+
+    for mn, data in FOOTY.items():
+        row = START_ROW - 1 + int(mn)
+        for hdr_regex, maker in FOOTY_TO_DATA_MAP.items():
+            c = col_map.get(hdr_regex)
+            if not c:
+                continue
+            try:
+                val = maker(data)
+            except Exception:
+                val = None
+            ws.cell(row=row, column=c, value=val)
+
+# ---------- Skriv hela Excel ----------
 def write_excel_bytes(template_path: str) -> bytes:
-    """
-    Öppnar mallen, säkerställer rubriker i J/K/L om de saknas,
-    skriver KUPONG (och ev. FOOTY), och returnerar bytes.
-    """
-    wb = load_workbook(template_path)
-    ws = wb[SHEET_NAME] if SHEET_NAME and SHEET_NAME in wb.sheetnames else wb.active
+    wb = _open_wb(template_path)
 
-    _ensure_layout(ws)
+    # 1) kupong → Data (om rubriker hittas)
+    write_kupong_into_data_sheet(wb)
+    # 2) footy → Data
+    write_footy_into_data_sheet(wb)
 
-    # Skriv kupongraderna
-    for i, r in enumerate(KUPONG, start=0):
-        row = START_ROW + i
-        _put(ws, row, "matchnr", r.get("matchnr"))
-        _put(ws, row, "hemmalag", r.get("hemmalag"))
-        _put(ws, row, "bortalag", r.get("bortalag"))
-        _put(ws, row, "odds_1", r.get("odds_1"))
-        _put(ws, row, "odds_x", r.get("odds_x"))
-        _put(ws, row, "odds_2", r.get("odds_2"))
-        _put(ws, row, "folk_1", r.get("folk_1"))
-        _put(ws, row, "folk_x", r.get("folk_x"))
-        _put(ws, row, "folk_2", r.get("folk_2"))
-        _put(ws, row, "spelv_1", r.get("spelv_1"))
-        _put(ws, row, "spelv_x", r.get("spelv_x"))
-        _put(ws, row, "spelv_2", r.get("spelv_2"))
-
-    # (Valfritt) skriv FOOTY på egen flik om du vill i framtiden
-    # if "Footy" in wb.sheetnames and FOOTY:
-    #     wf = wb["Footy"]
-    #     for mn, data in FOOTY.items():
-    #         row = START_ROW - 1 + mn
-    #         wf.cell(row=row, column=1, value=mn)
-    #         # Fyll fler fält här...
-
-    bio = BytesIO()
+    bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
